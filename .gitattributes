@@ -1,0 +1,4 @@
+# Los .asm se guardan en Windows-1252, como la plantilla de la cátedra.
+# "-text" evita que Git cambie los fines de línea; los diffs se siguen viendo.
+*.asm -text
+*.inc -text

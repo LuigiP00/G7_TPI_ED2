@@ -1,0 +1,30 @@
+# MPLAB X: archivos de compilación y configuración local
+build/
+dist/
+nbproject/private/
+*.o
+*.cod
+*.lst
+*.err
+*.cof
+*.map
+# Excepción: el .hex final se publica en firmware/hex/
+!firmware/hex/*.hex
+
+# KiCad: respaldos y configuración local de cada usuario
+*-backups/
+*.kicad_prl
+fp-info-cache
+*.lck
+_autosave-*
+
+# Python (GUI)
+__pycache__/
+*.pyc
+.venv/
+
+# Sistema operativo
+Thumbs.db
+desktop.ini
+.DS_Store
+~$*
