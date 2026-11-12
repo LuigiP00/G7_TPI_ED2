@@ -3,33 +3,46 @@
 ;
 ; @brief       Pulsómetro digital con alarma térmica (PIC16F887, cristal 4 MHz).
 ;
-; @details     PASOS 1 a 4. Deja configurados todos los periféricos del SEP
-;              y la estructura de interrupciones. Por ahora:
-;              - Timer0 interrumpe cada ~10 ms (base de tiempo del ADC, SSE.6)
-;                y avisa cada 100 ms y cada 1 s.
-;              - Timer1 interrumpe cada 5 ms y multiplexa los 4 dígitos del
-;                display de ánodo común (SSE.3.2, drivers PNP SSE.5.1).
-;              - Cada 100 ms se lee el LM35 en AN0 (SSE.6.1) y la temperatura
-;                se muestra como "t 25" en el display.
-;              - Como prueba, el LED de latido (RE0, SSE.3.4) parpadea cada 1 s.
-;              ADC (AN0/AN1, Vref+ externa), EUSART (9600 8N1) y PORTB
-;              (teclado, SSE.3.1) quedan configurados; sus interrupciones se
-;              habilitan en los pasos siguientes.
+; @details     Versión 0.4: integra la placa del grupo (display en RC/RD, botón
+;              y LEDs en PORTB, buzzer en RA4) con el resto del sistema.
+;
+;              - Timer0 (interrupción cada ~10 ms): base de tiempo de todo el
+;                programa. Cada tick se lee el sensor de pulso (AN1) y cada
+;                100 ms el LM35 (AN0).
+;              - Timer1 (interrupción cada 5 ms): multiplexado de los 4 dígitos
+;                (ánodo común, PNP BC557 en RC0-RC3, segmentos en RD0-RD6).
+;              - EUSART 9600 8N1: envía tramas de texto a la GUI y recibe las
+;                teclas '1', '2', 'A' y 'D'. La transmisión usa un buffer
+;                circular de 32 bytes y la interrupción TXIF.
+;              - Máquina de estados: ESPERA -> MIDIENDO (15 s) -> RESULTADO.
+;              - Latidos: umbral alto y umbral bajo (histéresis) + 250 ms de
+;                tiempo muerto. BPM = latidos en 15 s x 4.
+;              - Alarma térmica: T > 40 °C enciende LED rojo (RE0) y buzzer
+;                intermitente; se apaga con T <= 39 °C.
+;
+;              PROTOCOLO SERIE (PIC -> PC), cada trama termina en \r\n:
+;                T=025     temperatura, cada 500 ms
+;                S=0       en espera
+;                S=1,12    midiendo, segundos que faltan
+;                S=2       resultado listo
+;                B=072     resultado en BPM
+;                A=1 / A=0 alarma térmica activada / desactivada
+;                P=128     muestra del sensor de pulso (solo en modo 'D')
+;              PC -> PIC: '1' temperatura, '2' pulso, 'A' medir, 'D' depuración
 ;
 ; @author      G7_TPI_ED2
 ;
-; @date        02/11/2026
+; @date        12/11/2026
 ;
-; @version     0.3
+; @version     0.4
 ;*******************************************************************************
 
 ;===============================================================================
 ; DIRECTIVAS DE INCLUSIÓN
 ;===============================================================================
-LIST P=16F887
+    LIST P=16F887
 #include "p16f887.inc"
     ERRORLEVEL -302             ;Oculta el aviso "register not in bank 0"
-                                ;(usamos BANKSEL antes de cada registro)
 
 ;===============================================================================
 ; CONFIGURACIÓN GENERAL DEL MCU
@@ -41,108 +54,161 @@ LIST P=16F887
 ; DEFINICIÓN DE CONSTANTES
 ;===============================================================================
 ;--- Bases de tiempo -----------------------------------------------------------
-TMR0_PRECARGA   EQU D'100'      ;256-156 = 100 -> 156 x 64 us = 9,984 ms
-TMR1H_PRECARGA  EQU 0xEC        ;65536-5000 = 60536 = 0xEC78 -> 5 ms
+TMR0_PRECARGA   EQU D'100'      ;(256-100) x 64 us = 9,984 ms por tick
+TMR1H_PRECARGA  EQU 0xEC        ;65536 - 0xEC78 = 5000 cuentas = 5 ms
 TMR1L_PRECARGA  EQU 0x78
-TICKS_100MS     EQU D'10'       ;10 interrupciones de Timer0 = ~100 ms
-TICKS_1S        EQU D'100'      ;100 interrupciones de Timer0 = ~1 s
+TICKS_100MS     EQU D'10'       ;10 ticks = 100 ms
+BLOQUES_500MS   EQU D'5'        ;5 bloques de 100 ms = 500 ms
+TICKS_1S        EQU D'100'      ;100 ticks = 1 s
+VENTANA_SEG     EQU D'15'       ;Duración de la medición
+PRESENT_100MS   EQU D'20'       ;"G07" durante 2 s al encender
 
-;--- Umbrales del SEP (se usan en los próximos pasos) --------------------------
-ALARMA_T_ON     EQU D'41'       ;T > 40 °C  (ADRESH >= 41)
-ALARMA_T_OFF    EQU D'39'       ;T <= 39 °C
-VENTANA_SEG     EQU D'15'       ;Ventana de conteo de latidos: 15 s
-TIEMPO_MUERTO   EQU D'25'       ;25 x 10 ms = 250 ms sin contar cruces
+;--- Detección de latidos (cuentas del ADC, 1 cuenta = 9,77 mV) ----------------
+; El XD-58C/HW-827 tiene la salida centrada en 2,5 V; con el divisor 1/2 queda
+; en ~1,25 V = 128 cuentas. AJUSTAR con la señal real (modo 'D' de la GUI).
+UMBRAL_ALTO     EQU D'145'      ;Se cuenta un latido al llegar a este valor
+UMBRAL_BAJO     EQU D'130'      ;Se rearma al bajar de este valor
+TIEMPO_MUERTO   EQU D'25'       ;25 ticks = 250 ms sin contar otro latido
+LED_LAT_TICKS   EQU D'6'        ;Destello del LED de latido: 60 ms
+BEEP_TICKS      EQU D'10'       ;Pitido de inicio y fin: 100 ms
 BPM_MIN         EQU D'50'       ;Rango normal de frecuencia cardíaca
 BPM_MAX         EQU D'120'
 
-;--- Display de 4 dígitos (ánodo común, lógica negativa) ----------------------
-NUM_DIGITOS     EQU D'4'        ;Dígitos del display
-MASCARA_DIGITOS EQU B'00111100' ;RC2-RC5: bases de los PNP de cada dígito
-CHAR_P          EQU D'10'       ;Índices de TABLA_DECO_DSPL_AC: 0-9 = dígitos
-CHAR_T          EQU D'11'       ;'t'
-CHAR_GUION      EQU D'12'       ;'-'
-CHAR_BLANCO     EQU D'13'       ;dígito apagado
+;--- Alarma térmica (Vref+ = 2,50 V -> 1 cuenta = 0,977 °C) --------------------
+ALARMA_ON       EQU D'41'       ;41 cuentas = 40,0 °C: T > 40 °C enciende
+ALARMA_OFF      EQU D'40'       ;40 cuentas = 39,1 °C: T <= 39 °C apaga
+
+;--- ADC: valores de ADCON0 (ADCS=01 Fosc/8, ADON=1) ---------------------------
+ADC_AN0         EQU B'01000001' ;CHS=0000: LM35
+ADC_AN1         EQU B'01000101' ;CHS=0001: sensor de pulso
 
 ;--- EUSART --------------------------------------------------------------------
 SPBRG_9600      EQU D'25'       ;4 MHz / (16 x 26) = 9615 bps (BRGH = 1)
+TX_BUF          EQU 0x50        ;Buffer de transmisión: 0x50 a 0x6F
+TX_MASCARA      EQU 0x1F        ;32 posiciones -> índices de 0 a 31
+
+;--- Estados y modos -----------------------------------------------------------
+EST_ESPERA      EQU D'0'
+EST_MIDIENDO    EQU D'1'
+EST_RESULTADO   EQU D'2'
+MODO_PULSO      EQU D'0'
+MODO_TEMP       EQU D'1'
+
+;--- Segmentos (ánodo común: 0 = encendido; bit0=a ... bit6=g, bit7=dp) --------
+SEG_F           EQU 0x8E        ;a, e, f, g
+SEG_G           EQU 0xC2        ;a, c, d, e, f
+SEG_T           EQU 0x87        ;d, e, f, g
+SEG_GUION       EQU 0xBF        ;g
+SEG_APAGADO     EQU 0xFF
 
 ;--- Bits del registro FLAGS ---------------------------------------------------
-F_10MS          EQU 0           ;Pasaron 10 ms (lo pone ISR_TMR0)
-F_1S            EQU 1           ;Pasó 1 s (lo pone ISR_TMR0)
-F_RX            EQU 2           ;Llegó un carácter por la EUSART
-F_TECLA         EQU 3           ;Se apretó una tecla
-F_100MS         EQU 4           ;Pasaron 100 ms (lo pone ISR_TMR0)
+F_TICK          EQU 0           ;Pasaron 10 ms (lo pone ISR_TMR0)
+F_RX            EQU 1           ;Llegó un carácter (lo pone ISR_RX)
+F_ARMADO        EQU 2           ;Detector listo para contar un latido
+F_ALARMA        EQU 3           ;Alarma térmica activa
+F_BOTON_ANT     EQU 4           ;Estado anterior del botón (1 = suelto)
+F_DEBUG         EQU 5           ;Envío de muestras del sensor activado
+F_FASE          EQU 6           ;Fase del buzzer intermitente (500 ms)
+F_DIV           EQU 7           ;Divide por 2 el envío de muestras
 
-;--- Pines (SSE asociados) -----------------------------------------------------
-#define LED_TERMICO     PORTC,0 ;SSE.3.4  OPTICAL_SIGNALING
-#define BUZZER          PORTC,1 ;SSE.3.3  ACOUSTIC_SIGNALING (vía SSE.5.1)
-#define LED_LATIDO      PORTE,0 ;SSE.3.4  BEAT_SIGNALING
-#define LED_RANGO       PORTE,1 ;SSE.3.4  HR_RANGE_SIGNALING
+;--- Pines (bloque del informe) ------------------------------------------------
+#define BUZZER          PORTA,4 ;SSE.3.3 vía BC337 (SSE.5.1)
+#define BOTON           PORTB,0 ;Botón de inicio (activo en bajo)
+#define LED_LATIDO      PORTB,1 ;SSE.3.4 destella con cada latido
+#define LED_RESULTADO   PORTB,2 ;SSE.3.4 resultado listo (verde)
+#define LED_ALARMA      PORTE,0 ;SSE.3.4 alarma térmica (rojo)
+#define LED_RANGO       PORTE,1 ;SSE.3.4 frecuencia fuera de rango
 
 ;===============================================================================
 ; DEFINICIÓN DE VARIABLES
 ;===============================================================================
-;--- RAM compartida (0x70-0x7F): se accede desde cualquier banco ---------------
-W_TEMP          EQU 0x70        ;Copia de W durante la ISR
-STATUS_TEMP     EQU 0x71        ;Copia de STATUS durante la ISR
-PCLATH_TEMP     EQU 0x72        ;Copia de PCLATH durante la ISR
-FSR_TEMP        EQU 0x73        ;Copia de FSR durante la ISR
-TABLA_TMP       EQU 0x74        ;Índice auxiliar de las tablas
+    CBLOCK 0x20                 ;Banco 0
+        FLAGS
+        ESTADO                  ;EST_ESPERA, EST_MIDIENDO o EST_RESULTADO
+        MODO                    ;MODO_PULSO o MODO_TEMP
+        PRESENT_CONT            ;Bloques de 100 ms que quedan de "G07"
+        CONT_100MS              ;Ticks dentro del bloque de 100 ms (0-9)
+        CONT_500MS              ;Bloques de 100 ms dentro de 500 ms (0-4)
+        CONT_1S                 ;Ticks dentro del segundo de medición (0-99)
+        SEGUNDOS                ;Segundos que faltan de la medición
+        MUESTRA                 ;Última lectura del sensor de pulso
+        TEMP_C                  ;Última lectura del LM35 (cuentas ~ °C)
+        PULSOS                  ;Latidos contados en la ventana
+        BPM                     ;Resultado: PULSOS x 4
+        MUERTO_CONT             ;Ticks que faltan de tiempo muerto
+        LED_LAT_CONT            ;Ticks que faltan del destello de latido
+        BEEP_CONT               ;Ticks que faltan del pitido
+        CENTENAS                ;Resultado de BIN_A_DEC
+        DECENAS
+        UNIDADES
+        BCD_AUX
+        ADC_DEMORA              ;Demora de adquisición del ADC
+        RX_DATO                 ;Último carácter recibido
+        TX_IN                   ;Próxima posición libre del buffer TX
+        TX_OUT                  ;Próximo carácter a enviar
+        TX_SIG                  ;Auxiliar de UART_PUT
+        TX_CHAR                 ;Carácter a encolar
+        DSPL_1                  ;Segmentos del dígito 1 (izquierda)
+        DSPL_2                  ;DSPL_1 a DSPL_4 deben ser contiguos:
+        DSPL_3                  ;la ISR los recorre con FSR
+        DSPL_4
+        MUX_IDX                 ;Dígito que enciende la próxima ISR (0-3)
+        MUX_MASK                ;Patrón de PORTC de ese dígito
+        TBL_IDX                 ;Índice auxiliar de TABLA_DECO
+    ENDC
+    IF TBL_IDX >= TX_BUF
+        ERROR "Las variables pisan el buffer de transmisión"
+    ENDIF
 
-;--- Banco 0 -------------------------------------------------------------------
-CONT_10MS       EQU 0x20        ;Cuenta interrupciones de Timer0 (0 a 99)
-FLAGS           EQU 0x21        ;Banderas de eventos (ver bits F_xxx)
-DSPL_DIG1       EQU 0x22        ;Buffer del display: dígito 1 (izquierda)
-DSPL_DIG2       EQU 0x23        ;Buffer del display: dígito 2
-DSPL_DIG3       EQU 0x24        ;Buffer del display: dígito 3
-DSPL_DIG4       EQU 0x25        ;Buffer del display: dígito 4 (derecha)
-DSPL_INDICE     EQU 0x26        ;Dígito que se enciende ahora (0 a 3)
-TEMP_C          EQU 0x27        ;Última temperatura medida (°C)
-PULSO_CONT      EQU 0x28        ;Latidos contados en la ventana actual
-VENTANA_CONT    EQU 0x29        ;Segundos que faltan de la ventana de 15 s
-MUERTO_CONT     EQU 0x2A        ;Ticks de 10 ms que faltan de tiempo muerto
-BPM             EQU 0x2B        ;Resultado: PULSO_CONT x 4
-ESTADO          EQU 0x2C        ;0 = ESPERA, 1 = MIDIENDO, 2 = RESULTADO
-MODO            EQU 0x2D        ;0 = mostrar temperatura, 1 = mostrar pulso
-RX_DATO         EQU 0x2E        ;Último carácter recibido por la EUSART
-CONT_100MS      EQU 0x2F        ;Cuenta interrupciones de Timer0 (0 a 9)
-CENTENAS        EQU 0x30        ;Resultado de BIN_A_BCD
-DECENAS         EQU 0x31
-UNIDADES        EQU 0x32
-BCD_AUX         EQU 0x33        ;Número que BIN_A_BCD va descomponiendo
-ADC_DEMORA      EQU 0x34        ;Contador de la demora de adquisición
+    CBLOCK 0x70                 ;RAM compartida (visible desde todos los bancos)
+        W_TEMP
+        STATUS_TEMP
+        FSR_TEMP
+        PCLATH_TEMP
+    ENDC
 
 ;===============================================================================
 ; DECLARACIÓN DE MACROS PARA CONFIGURACIÓN DE REGISTROS
 ;===============================================================================
 ;-------------------------------------------------------------------------------
-; CONFIG_PUERTOS: entradas analógicas, sentido de cada pin y pull-ups.
+; CONFIG_PUERTOS: entradas analógicas, sentido de los pines, pull-up de RB0.
 ;-------------------------------------------------------------------------------
 CONFIG_PUERTOS  MACRO
     BANKSEL PORTA
-    CLRF    PORTA               ;Valores de salida antes de habilitarlas
-    CLRF    PORTB
-    MOVLW   MASCARA_DIGITOS     ;RC2-RC5 en 1: los 4 dígitos apagados (PNP)
-    MOVWF   PORTC               ;RC0 (LED) y RC1 (buzzer) en 0: apagados
-    MOVLW   B'11111111'         ;Segmentos en 1: apagados (ánodo común)
+    CLRF    PORTA               ;Buzzer apagado
+    CLRF    PORTB               ;LEDs de PORTB apagados
+    CLRF    PORTE               ;LEDs de PORTE apagados
+    MOVLW   B'11111111'         ;Lógica negativa: dígitos y segmentos apagados
+    MOVWF   PORTC
     MOVWF   PORTD
-    CLRF    PORTE
     BANKSEL ANSEL
-    MOVLW   B'00001011'         ;AN0 (LM35), AN1 (pulso), AN3 (Vref+) analógicas
-    MOVWF   ANSEL               ;AN2 y AN4-AN7 (incluye RE0-RE2) digitales
-    CLRF    ANSELH              ;AN8-AN13 digitales: PORTB entero digital
+    MOVLW   B'00001011'         ;AN0 (LM35), AN1 (pulso), AN3 (Vref+)
+    MOVWF   ANSEL
+    CLRF    ANSELH              ;PORTB digital
     BANKSEL TRISA
-    MOVLW   B'11001011'         ;RA0, RA1, RA3 entradas; RA6/RA7 = cristal
-    MOVWF   TRISA
-    MOVLW   B'11110000'         ;RB0-RB3 filas (salidas), RB4-RB7 columnas
+    MOVLW   B'11001011'         ;RA0, RA1, RA3 entradas; RA4 salida (buzzer)
+    MOVWF   TRISA               ;RA6/RA7: cristal
+    MOVLW   B'00000001'         ;RB0 entrada (botón); RB1, RB2 salidas (LEDs)
     MOVWF   TRISB
-    MOVLW   B'11000000'         ;RC0-RC5 salidas; RC6 (TX) y RC7 (RX) para EUSART
+    MOVLW   B'11110000'         ;RC0-RC3 salidas (dígitos); RC6/RC7 EUSART
     MOVWF   TRISC
-    CLRF    TRISD               ;RD0-RD6 segmentos a-g: salidas
-    CLRF    TRISE               ;RE0 y RE1 (LEDs) salidas
-    MOVLW   B'11110000'         ;Pull-ups internas solo en las columnas
+    CLRF    TRISD               ;RD0-RD7 salidas (segmentos)
+    CLRF    TRISE               ;RE0, RE1 salidas (LEDs)
+    MOVLW   B'00000001'         ;Pull-up interna solo en RB0
     MOVWF   WPUB
     BANKSEL PORTA
+    ENDM
+
+;-------------------------------------------------------------------------------
+; CONFIG_ADC: Vref+ externa en RA3, resultado justificado a izquierda, AN1.
+;-------------------------------------------------------------------------------
+CONFIG_ADC      MACRO
+    BANKSEL ADCON1
+    MOVLW   B'00010000'         ;ADFM=0, VCFG1=0 (Vref- = GND), VCFG0=1 (RA3)
+    MOVWF   ADCON1
+    BANKSEL ADCON0
+    MOVLW   ADC_AN1
+    MOVWF   ADCON0
     ENDM
 
 ;-------------------------------------------------------------------------------
@@ -150,7 +216,7 @@ CONFIG_PUERTOS  MACRO
 ;-------------------------------------------------------------------------------
 CONFIG_TMR0     MACRO
     BANKSEL OPTION_REG
-    MOVLW   B'00000101'         ;RBPU=0, T0CS=0, PSA=0, PS2:PS0=101 (1:64)
+    MOVLW   B'00000101'         ;RBPU=0, T0CS=0, PSA=0, PS=101 (1:64)
     MOVWF   OPTION_REG
     BANKSEL TMR0
     MOVLW   TMR0_PRECARGA
@@ -158,7 +224,7 @@ CONFIG_TMR0     MACRO
     ENDM
 
 ;-------------------------------------------------------------------------------
-; CONFIG_TMR1: reloj interno, prescaler 1:1, precarga para 5 ms, encendido.
+; CONFIG_TMR1: reloj interno, prescaler 1:1, 5 ms, encendido.
 ;-------------------------------------------------------------------------------
 CONFIG_TMR1     MACRO
     BANKSEL T1CON
@@ -166,25 +232,12 @@ CONFIG_TMR1     MACRO
     MOVWF   TMR1H
     MOVLW   TMR1L_PRECARGA
     MOVWF   TMR1L
-    MOVLW   B'00000001'         ;T1CKPS=00 (1:1), TMR1CS=0 (Fosc/4), TMR1ON=1
+    MOVLW   B'00000001'         ;T1CKPS=00, TMR1CS=0, TMR1ON=1
     MOVWF   T1CON
     ENDM
 
 ;-------------------------------------------------------------------------------
-; CONFIG_ADC: Vref+ externa en RA3, Vref- = GND, justificado a izquierda,
-; reloj Fosc/8 (TAD = 2 us), canal inicial AN0, módulo encendido.
-;-------------------------------------------------------------------------------
-CONFIG_ADC      MACRO
-    BANKSEL ADCON1
-    MOVLW   B'00010000'         ;ADFM=0 (izquierda), VCFG1=0, VCFG0=1 (RA3)
-    MOVWF   ADCON1
-    BANKSEL ADCON0
-    MOVLW   B'01000001'         ;ADCS=01 (Fosc/8), CHS=0000 (AN0), ADON=1
-    MOVWF   ADCON0
-    ENDM
-
-;-------------------------------------------------------------------------------
-; CONFIG_EUSART: asíncrona, 9600 bps, 8 bits, sin paridad, 1 stop (8N1).
+; CONFIG_EUSART: asíncrona, 9600 bps, 8N1, transmisión y recepción.
 ;-------------------------------------------------------------------------------
 CONFIG_EUSART   MACRO
     BANKSEL BAUDCTL
@@ -193,69 +246,45 @@ CONFIG_EUSART   MACRO
     MOVLW   SPBRG_9600
     MOVWF   SPBRG
     CLRF    SPBRGH
-    MOVLW   B'00100100'         ;TXEN=1, SYNC=0 (asíncrona), BRGH=1
+    MOVLW   B'00100100'         ;TXEN=1, SYNC=0, BRGH=1
     MOVWF   TXSTA
     BANKSEL RCSTA
-    MOVLW   B'10010000'         ;SPEN=1 (habilita el puerto), CREN=1 (recibe)
+    MOVLW   B'10010000'         ;SPEN=1, CREN=1
     MOVWF   RCSTA
     ENDM
 
 ;-------------------------------------------------------------------------------
-; INIT_VARIABLES: todas las variables del programa en 0.
+; INIT_VARIABLES: estado inicial del programa.
 ;-------------------------------------------------------------------------------
 INIT_VARIABLES  MACRO
-    BANKSEL CONT_10MS
-    CLRF    CONT_10MS
-    CLRF    FLAGS
-    CLRF    DSPL_DIG1
-    CLRF    DSPL_DIG2
-    CLRF    DSPL_DIG3
-    CLRF    DSPL_DIG4
-    CLRF    DSPL_INDICE
-    CLRF    TEMP_C
-    CLRF    PULSO_CONT
-    CLRF    VENTANA_CONT
-    CLRF    MUERTO_CONT
-    CLRF    BPM
-    CLRF    ESTADO
-    CLRF    MODO
-    CLRF    RX_DATO
-    CLRF    CONT_100MS
-    CLRF    CENTENAS
-    CLRF    DECENAS
-    CLRF    UNIDADES
-    CLRF    BCD_AUX
-    CLRF    ADC_DEMORA
+    BANKSEL FLAGS
+    MOVLW   FLAGS
+    MOVWF   FSR                 ;Pone en 0 desde FLAGS hasta TBL_IDX
+INIT_LIMPIAR
+    CLRF    INDF
+    INCF    FSR,F
+    MOVF    FSR,W
+    XORLW   TBL_IDX + 1
+    BTFSS   STATUS,Z
+    GOTO    INIT_LIMPIAR
+    BSF     FLAGS,F_BOTON_ANT   ;El botón arranca suelto
+    MOVLW   PRESENT_100MS
+    MOVWF   PRESENT_CONT
+    MOVLW   B'11111110'
+    MOVWF   MUX_MASK            ;El multiplexado arranca por el dígito 1
     ENDM
 
 ;-------------------------------------------------------------------------------
-; CFG_DIGITOS_DSPL: mensaje inicial del display, "t---", hasta la primera
-; lectura del LM35. El buffer guarda ÍNDICES de caracteres; la ISR los
-; decodifica.
-;-------------------------------------------------------------------------------
-CFG_DIGITOS_DSPL MACRO
-    BANKSEL DSPL_DIG1
-    MOVLW   CHAR_T
-    MOVWF   DSPL_DIG1           ;Dígito 1 (izquierda) -> 't'
-    MOVLW   CHAR_GUION
-    MOVWF   DSPL_DIG2           ;Dígitos 2 a 4 -> '-'
-    MOVWF   DSPL_DIG3           ;(W sigue valiendo CHAR_GUION)
-    MOVWF   DSPL_DIG4
-    MOVLW   NUM_DIGITOS - 1
-    MOVWF   DSPL_INDICE         ;El primer barrido arranca por el dígito 1
-    ENDM
-
-;-------------------------------------------------------------------------------
-; CONFIG_INTERRUPCIONES: por ahora solo Timer0 y Timer1.
-; (RCIE se habilita en el paso 6 y RBIE en el paso del teclado.)
+; CONFIG_INTERRUPCIONES: Timer0, Timer1 y recepción serie. TXIE lo maneja
+; UART_PUT / ISR_TX según haya o no datos para enviar.
 ;-------------------------------------------------------------------------------
 CONFIG_INTERRUPCIONES MACRO
     BANKSEL PIE1
-    MOVLW   B'00000001'         ;TMR1IE=1 (RCIE=0 por ahora)
-    MOVWF   PIE1
+    BSF     PIE1,TMR1IE
+    BSF     PIE1,RCIE
     BANKSEL PIR1
-    CLRF    PIR1                ;Borra banderas pendientes de periféricos
-    MOVLW   B'11100000'         ;GIE=1, PEIE=1, T0IE=1, banderas en 0
+    BCF     PIR1,TMR1IF
+    MOVLW   B'11100000'         ;GIE=1, PEIE=1, T0IE=1
     MOVWF   INTCON
     ENDM
 
@@ -263,32 +292,36 @@ CONFIG_INTERRUPCIONES MACRO
 ; INICIALIZACIÓN DEL MCU (CÓDIGO ABSOLUTO)
 ;===============================================================================
     ORG     0x00                ;Vector de Reset
-    GOTO    INICIO              ;Salto al inicio del programa principal
+    GOTO    INICIO
     ORG     0x04                ;Vector de Interrupción
-    GOTO    ISR_INICIO          ;Salto a la Rutina de Servicio de Interrupción
-    ORG     0x05                ;Ubicación Programa Principal en la memoria
+    GOTO    ISR_INICIO
+    ORG     0x05
 
 ;===============================================================================
 ; INICIALIZACIÓN DE MACROS PARA CONFIGURACIÓN DE REGISTROS
 ;===============================================================================
-INICIO      ;-----Inicialización de Macros-------
+INICIO
     CONFIG_PUERTOS
-    INIT_VARIABLES
-    CFG_DIGITOS_DSPL
+    CONFIG_ADC
     CONFIG_TMR0
     CONFIG_TMR1
-    CONFIG_ADC
     CONFIG_EUSART
-    CONFIG_INTERRUPCIONES       ;Siempre última: recién acá arrancan las ISR
+    INIT_VARIABLES
+    CALL    MOSTRAR_G07         ;El display ya tiene datos válidos
+    MOVLW   '0'
+    CALL    ENVIAR_ESTADO       ;"S=0": en espera
+    CONFIG_INTERRUPCIONES       ;Última: recién acá arrancan las ISR
 
 ;===============================================================================
 ; INICIO PROGRAMA PRINCIPAL
 ;===============================================================================
 MAIN_LOOP
-    BTFSC   FLAGS,F_100MS       ;¿Pasaron 100 ms?
-    CALL    TAREA_100MS         ;Sí: medir y mostrar la temperatura
-    BTFSC   FLAGS,F_1S          ;¿Pasó 1 segundo?
-    CALL    TAREA_1S            ;Sí: tareas de cada segundo
+    BTFSC   FLAGS,F_RX          ;¿Llegó una tecla desde la GUI?
+    CALL    PROCESAR_RX
+    BTFSS   FLAGS,F_TICK        ;¿Pasaron 10 ms?
+    GOTO    MAIN_LOOP
+    BCF     FLAGS,F_TICK
+    CALL    TAREA_10MS
     GOTO    MAIN_LOOP
 
 ;===============================================================================
@@ -296,26 +329,29 @@ MAIN_LOOP
 ;===============================================================================
 ISR_INICIO
     ;----------Guardado de Contexto----------
-    MOVWF   W_TEMP              ;Guarda W (RAM compartida, cualquier banco)
-    SWAPF   STATUS,W            ;Copia STATUS sin modificar sus banderas
-    CLRF    STATUS              ;Banco 0 para el resto de la ISR
+    MOVWF   W_TEMP
+    SWAPF   STATUS,W
+    CLRF    STATUS              ;Banco 0, IRP = 0
     MOVWF   STATUS_TEMP
     MOVF    PCLATH,W
     MOVWF   PCLATH_TEMP
-    CLRF    PCLATH              ;Página 0 de programa
-    MOVF    FSR,W               ;FSR se usa en el multiplexado
+    CLRF    PCLATH
+    MOVF    FSR,W
     MOVWF   FSR_TEMP
     ;----------------------------------------
     ;-----Identificación de Interrupción-----
-    BTFSC   INTCON,T0IF         ;¿Desbordó Timer0?
+    BTFSC   INTCON,T0IF         ;¿Timer0? (base de 10 ms)
     GOTO    ISR_TMR0
-    BTFSC   PIR1,TMR1IF         ;¿Desbordó Timer1?
+    BTFSC   PIR1,TMR1IF         ;¿Timer1? (multiplexado)
     GOTO    ISR_TMR1
-    BTFSC   PIR1,RCIF           ;¿Llegó un dato por la EUSART?
+    BTFSC   PIR1,RCIF           ;¿Llegó un carácter?
     GOTO    ISR_RX
-    BTFSC   INTCON,RBIF         ;¿Cambió alguna columna del teclado?
-    GOTO    ISR_IOC
-    GOTO    ISR_FIN             ;Ninguna conocida: salir
+    BTFSS   PIR1,TXIF           ;¿TXREG libre?...
+    GOTO    ISR_FIN
+    BANKSEL PIE1
+    BTFSC   PIE1,TXIE           ;...¿y hay datos esperando? (TXIE = 1)
+    GOTO    ISR_TX
+    GOTO    ISR_FIN
     ;----------------------------------------
 
 ;===============================================================================
@@ -327,284 +363,676 @@ ISR_FIN
     MOVWF   FSR
     MOVF    PCLATH_TEMP,W
     MOVWF   PCLATH
-    SWAPF   STATUS_TEMP,W       ;Vuelve STATUS (y el banco) como estaba
+    SWAPF   STATUS_TEMP,W
     MOVWF   STATUS
-    SWAPF   W_TEMP,F            ;Vuelve W sin tocar STATUS
+    SWAPF   W_TEMP,F
     SWAPF   W_TEMP,W
-    RETFIE                      ;Regresa y vuelve a habilitar GIE
+    RETFIE
     ;----------------------------------------
 
-;===============================================================================
-; SUBRUTINAS
-;===============================================================================
 ;*******************************************************************************
-; @brief    TAREA_100MS: mide la temperatura y la muestra.
-;
-; @details  Corre cada 100 ms, cuando ISR_TMR0 levanta F_100MS.
-;*******************************************************************************
-TAREA_100MS
-    BCF     FLAGS,F_100MS       ;Baja la bandera
-    CALL    ADC_LEER_TEMP       ;W = lectura del LM35 = °C
-    MOVWF   TEMP_C
-    CALL    MOSTRAR_TEMP        ;"t 25" en el display
-    RETURN
-
-;*******************************************************************************
-; @brief    TAREA_1S: tareas de cada segundo.
-;*******************************************************************************
-TAREA_1S
-    BCF     FLAGS,F_1S          ;Baja la bandera
-    CALL    PRUEBA_LED_1S       ;Prueba de la base de tiempo (paso 2)
-    RETURN
-
-;*******************************************************************************
-; @brief    PRUEBA_LED_1S: invierte el LED de latido (RE0).
-;
-; @details  Prueba temporal del paso 2: si el LED cambia una vez por segundo,
-;           Timer0 y su ISR funcionan. Se elimina cuando RE0 pase a marcar
-;           los latidos.
-;*******************************************************************************
-PRUEBA_LED_1S
-    MOVLW   B'00000001'         ;Máscara del bit 0 (RE0)
-    XORWF   PORTE,F             ;Invierte RE0
-    RETURN
-
-;*******************************************************************************
-; @brief    ADC_LEER_TEMP: convierte el canal AN0 (LM35, SSE.6.1).
-;
-; @details  Con Vref+ = 2,56 V y 8 bits, cada cuenta vale 10 mV = 1 °C:
-;           el resultado en W ya es la temperatura en °C.
-;*******************************************************************************
-ADC_LEER_TEMP
-    MOVLW   B'01000001'         ;ADCS=01 (Fosc/8), CHS=0000 (AN0), ADON=1
-    MOVWF   ADCON0
-    CALL    ADC_CONVERTIR
-    RETURN
-
-;*******************************************************************************
-; @brief    ADC_CONVERTIR: convierte el canal ya elegido en ADCON0.
-;
-; @details  1) Espera ~20 us para que el capacitor interno del ADC se cargue
-;           con la tensión del canal (tiempo de adquisición).
-;           2) Pone GO=1 y espera a que el hardware lo baje (~22 us).
-;           3) Devuelve en W los 8 bits altos del resultado (ADRESH).
-;           La usan AN0 (temperatura) y, más adelante, AN1 (pulso).
-;*******************************************************************************
-ADC_CONVERTIR
-    MOVLW   D'7'
-    MOVWF   ADC_DEMORA
-ADC_ADQUISICION
-    DECFSZ  ADC_DEMORA,F        ;7 vueltas de 3 us = ~20 us
-    GOTO    ADC_ADQUISICION
-    BSF     ADCON0,GO           ;Arranca la conversión
-ADC_ESPERA
-    BTFSC   ADCON0,GO           ;¿Terminó? (GO vuelve a 0 solo)
-    GOTO    ADC_ESPERA          ;No: seguir esperando
-    MOVF    ADRESH,W            ;Sí: W = resultado (8 bits)
-    RETURN
-
-;*******************************************************************************
-; @brief    MOSTRAR_TEMP: escribe "t" y TEMP_C en el buffer del display.
-;
-; @details  Formato "t 25" (o "t125" a partir de 100 °C): la centena se
-;           muestra apagada cuando vale 0.
-;*******************************************************************************
-MOSTRAR_TEMP
-    MOVF    TEMP_C,W
-    CALL    BIN_A_BCD           ;Separa centenas, decenas y unidades
-    MOVLW   CHAR_T
-    MOVWF   DSPL_DIG1           ;'t'
-    MOVF    CENTENAS,W          ;W = centenas (Z = 1 si es 0)
-    BTFSC   STATUS,Z
-    MOVLW   CHAR_BLANCO         ;Si es 0: dígito apagado
-    MOVWF   DSPL_DIG2
-    MOVF    DECENAS,W
-    MOVWF   DSPL_DIG3
-    MOVF    UNIDADES,W
-    MOVWF   DSPL_DIG4
-    RETURN
-
-;*******************************************************************************
-; @brief    BIN_A_BCD: separa un número de 0 a 255 en sus tres cifras.
-;
-; @details  Entrada en W. Resta 100 mientras se pueda (cuenta CENTENAS),
-;           después resta 10 (cuenta DECENAS); lo que queda son UNIDADES.
-;           Ejemplo: 137 -> 1 resta de 100 (queda 37) -> 3 restas de 10
-;           (queda 7) -> CENTENAS=1, DECENAS=3, UNIDADES=7.
-;*******************************************************************************
-BIN_A_BCD
-    MOVWF   BCD_AUX
-    CLRF    CENTENAS
-    CLRF    DECENAS
-BCD_CENTENAS
-    MOVLW   D'100'
-    SUBWF   BCD_AUX,W           ;W = BCD_AUX - 100
-    BTFSS   STATUS,C            ;C = 0 si el resultado dio negativo
-    GOTO    BCD_DECENAS         ;No entra otro 100: pasar a decenas
-    MOVWF   BCD_AUX             ;Sí entra: guardar lo que queda
-    INCF    CENTENAS,F
-    GOTO    BCD_CENTENAS
-BCD_DECENAS
-    MOVLW   D'10'
-    SUBWF   BCD_AUX,W           ;W = BCD_AUX - 10
-    BTFSS   STATUS,C
-    GOTO    BCD_UNIDADES
-    MOVWF   BCD_AUX
-    INCF    DECENAS,F
-    GOTO    BCD_DECENAS
-BCD_UNIDADES
-    MOVF    BCD_AUX,W           ;Lo que quedó (0 a 9)
-    MOVWF   UNIDADES
-    RETURN
-
-;*******************************************************************************
-; @brief    MUX_DSPL: enciende el siguiente dígito del display (uno por vez).
-;
-; @details  Se llama desde ISR_TMR1 cada 5 ms; 4 dígitos -> cada uno se
-;           refresca cada 20 ms (50 Hz). Orden anti-fantasma: primero apagar
-;           todos, después cargar los segmentos, recién al final encender el
-;           dígito nuevo. Lógica negativa: 0 = encendido.
-;*******************************************************************************
-MUX_DSPL
-    MOVLW   MASCARA_DIGITOS
-    IORWF   PORTC,F             ;RC2-RC5 en 1: apaga los 4 dígitos
-    INCF    DSPL_INDICE,F       ;Pasa al dígito siguiente
-    MOVF    DSPL_INDICE,W
-    XORLW   NUM_DIGITOS         ;¿Llegó a 4?
-    BTFSC   STATUS,Z
-    CLRF    DSPL_INDICE         ;Sí: vuelve al dígito 1 (índice 0)
-    MOVF    DSPL_INDICE,W       ;Direccionamiento indirecto:
-    ADDLW   DSPL_DIG1           ;FSR = dirección de DSPL_DIG1 + índice
-    MOVWF   FSR
-    BCF     STATUS,IRP          ;Bancos 0 y 1 para el acceso indirecto
-    MOVF    INDF,W              ;W = carácter guardado en ese dígito
-    CALL    TABLA_DECO_DSPL_AC  ;W = patrón de segmentos
-    MOVWF   PORTD               ;Carga los segmentos
-    MOVF    DSPL_INDICE,W
-    CALL    TABLA_CTRL_DSPL_AC  ;W = máscara con un 0 en el dígito a encender
-    ANDWF   PORTC,F             ;Enciende solo ese dígito (no toca RC0, RC1)
-    RETURN
-
-;*******************************************************************************
-; @brief    TABLA_CTRL_DSPL_AC: índice de dígito (0-3) -> máscara para PORTC.
-;
-; @details  Un 0 en la base del PNP lo satura y enciende el dígito. Se aplica
-;           con ANDWF, así RC0 (LED) y RC1 (buzzer) quedan como estaban.
-;           Carga PCLATH antes del salto: funciona en cualquier posición de
-;           memoria, siempre que la tabla no cruce un límite de 256 palabras.
-;*******************************************************************************
-TABLA_CTRL_DSPL_AC
-    MOVWF   TABLA_TMP           ;Guarda el índice
-    MOVLW   HIGH(TABLA_CTRL_INI)
-    MOVWF   PCLATH              ;Parte alta de la dirección de la tabla
-    MOVF    TABLA_TMP,W
-    ADDWF   PCL,F               ;Salta a la fila "índice"
-TABLA_CTRL_INI
-    RETLW   B'11111011'         ;0: dígito 1 (RC2 = 0)
-    RETLW   B'11110111'         ;1: dígito 2 (RC3 = 0)
-    RETLW   B'11101111'         ;2: dígito 3 (RC4 = 0)
-    RETLW   B'11011111'         ;3: dígito 4 (RC5 = 0)
-TABLA_CTRL_FIN
-    IF HIGH(TABLA_CTRL_INI) != HIGH(TABLA_CTRL_FIN - 1)
-        ERROR "TABLA_CTRL_DSPL_AC cruza un limite de 256 palabras"
-    ENDIF
-
-;*******************************************************************************
-; @brief    TABLA_DECO_DSPL_AC: índice de carácter -> segmentos (ánodo común).
-;
-; @details  Bits: 0=a 1=b 2=c 3=d 4=e 5=f 6=g. 0 = segmento encendido.
-;           Los dígitos 0-9 son los mismos valores del TPL3.
-;*******************************************************************************
-TABLA_DECO_DSPL_AC
-    MOVWF   TABLA_TMP
-    MOVLW   HIGH(TABLA_DECO_INI)
-    MOVWF   PCLATH
-    MOVF    TABLA_TMP,W
-    ADDWF   PCL,F
-TABLA_DECO_INI
-    RETLW   0x40                ;0  '0'
-    RETLW   0x79                ;1  '1'
-    RETLW   0x24                ;2  '2'
-    RETLW   0x30                ;3  '3'
-    RETLW   0x19                ;4  '4'
-    RETLW   0x12                ;5  '5'
-    RETLW   0x02                ;6  '6'
-    RETLW   0x78                ;7  '7'
-    RETLW   0x00                ;8  '8'
-    RETLW   0x18                ;9  '9'
-    RETLW   0x0C                ;10 'P' (a,b,e,f,g)
-    RETLW   0x07                ;11 't' (d,e,f,g)
-    RETLW   0x3F                ;12 '-' (g)
-    RETLW   0xFF                ;13 apagado
-TABLA_DECO_FIN
-    IF HIGH(TABLA_DECO_INI) != HIGH(TABLA_DECO_FIN - 1)
-        ERROR "TABLA_DECO_DSPL_AC cruza un limite de 256 palabras"
-    ENDIF
-
-;*******************************************************************************
-; @brief    ISR_TMR0: base de tiempo de 10 ms.
-;
-; @details  Recarga Timer0 y avisa cada 10 ms (F_10MS), cada 100 ms
-;           (F_100MS) y cada 1 s (F_1S).
+; @brief    ISR_TMR0: base de tiempo de 10 ms. Solo avisa con F_TICK.
 ;*******************************************************************************
 ISR_TMR0
+    BCF     INTCON,T0IF
     MOVLW   TMR0_PRECARGA
-    MOVWF   TMR0                ;Recarga para el próximo período de 10 ms
-    BCF     INTCON,T0IF         ;Baja la bandera de Timer0
-    BSF     FLAGS,F_10MS        ;Aviso al lazo principal: pasaron 10 ms
-    INCF    CONT_100MS,F        ;Cuenta para los 100 ms
-    MOVF    CONT_100MS,W
-    XORLW   TICKS_100MS         ;¿Llegó a 10?
-    BTFSS   STATUS,Z
-    GOTO    ISR_TMR0_1S         ;No: seguir con la cuenta de 1 s
-    CLRF    CONT_100MS          ;Sí: reiniciar
-    BSF     FLAGS,F_100MS       ;Aviso: pasaron 100 ms
-ISR_TMR0_1S
-    INCF    CONT_10MS,F         ;Cuenta para el segundo
-    MOVF    CONT_10MS,W
-    XORLW   TICKS_1S            ;¿Llegó a 100?
-    BTFSS   STATUS,Z
-    GOTO    ISR_FIN             ;No: salir
-    CLRF    CONT_10MS           ;Sí: reiniciar la cuenta
-    BSF     FLAGS,F_1S          ;Aviso: pasó 1 segundo
+    MOVWF   TMR0
+    BSF     FLAGS,F_TICK
     GOTO    ISR_FIN
 
 ;*******************************************************************************
-; @brief    ISR_TMR1: base de tiempo de 5 ms para el multiplexado.
+; @brief    ISR_TMR1: multiplexado, un dígito cada 5 ms (código de la placa).
 ;
-; @details  Recarga Timer1 y enciende el dígito siguiente (MUX_DSPL).
+; @details  Apaga los 4 dígitos, carga los segmentos del dígito actual
+;           (DSPL_1 + MUX_IDX) y recién después lo habilita.
 ;*******************************************************************************
 ISR_TMR1
+    BCF     PIR1,TMR1IF
     MOVLW   TMR1H_PRECARGA
-    MOVWF   TMR1H               ;Recarga para el próximo período de 5 ms
+    MOVWF   TMR1H
     MOVLW   TMR1L_PRECARGA
     MOVWF   TMR1L
-    BCF     PIR1,TMR1IF         ;Baja la bandera de Timer1
-    CALL    MUX_DSPL            ;Barrido del display
+    MOVLW   B'11111111'
+    MOVWF   PORTC               ;Todos los dígitos apagados
+    MOVLW   DSPL_1
+    ADDWF   MUX_IDX,W
+    MOVWF   FSR                 ;FSR = &DSPL_1 + MUX_IDX
+    MOVF    INDF,W
+    MOVWF   PORTD               ;Segmentos del dígito actual
+    MOVF    MUX_MASK,W
+    MOVWF   PORTC               ;Habilita el dígito actual
+    INCF    MUX_IDX,F
+    BSF     STATUS,C
+    RLF     MUX_MASK,F          ;Corre el 0 al dígito siguiente
+    MOVF    MUX_IDX,W
+    XORLW   D'4'
+    BTFSS   STATUS,Z
+    GOTO    ISR_FIN
+    CLRF    MUX_IDX             ;Después del dígito 4 vuelve al 1
+    MOVLW   B'11111110'
+    MOVWF   MUX_MASK
     GOTO    ISR_FIN
 
 ;*******************************************************************************
-; @brief    ISR_RX: dato recibido por la EUSART.
+; @brief    ISR_RX: guarda el carácter recibido y avisa con F_RX.
 ;
-; @details  Leer RCREG baja RCIF. Guarda el carácter y avisa con F_RX.
-;           (Se habilita en el paso 6.)
+; @details  Si hubo desborde (OERR), la recepción se reinicia con CREN.
 ;*******************************************************************************
 ISR_RX
-    MOVF    RCREG,W             ;Leer RCREG borra RCIF
+    BTFSS   RCSTA,OERR
+    GOTO    ISR_RX_LEER
+    BCF     RCSTA,CREN          ;Desborde: reiniciar la recepción
+    BSF     RCSTA,CREN
+ISR_RX_LEER
+    MOVF    RCREG,W             ;Leer RCREG baja RCIF
     MOVWF   RX_DATO
     BSF     FLAGS,F_RX
     GOTO    ISR_FIN
 
 ;*******************************************************************************
-; @brief    ISR_IOC: cambio de estado en RB4-RB7 (columnas del teclado).
+; @brief    ISR_TX: envía el próximo carácter del buffer circular.
 ;
-; @details  Leer PORTB y luego borrar RBIF. (Se completa en el paso del
-;           teclado.)
+; @details  Si el buffer quedó vacío (TX_OUT = TX_IN), apaga TXIE para que
+;           TXIF no siga pidiendo interrupciones.
 ;*******************************************************************************
-ISR_IOC
-    MOVF    PORTB,W             ;Leer PORTB termina la condición de cambio
-    BCF     INTCON,RBIF
+ISR_TX
+    BANKSEL TX_OUT
+    MOVF    TX_OUT,W
+    XORWF   TX_IN,W             ;¿TX_OUT = TX_IN?
+    BTFSS   STATUS,Z
+    GOTO    ISR_TX_ENVIAR
+    BANKSEL PIE1
+    BCF     PIE1,TXIE           ;Vacío: no hay nada más que enviar
     GOTO    ISR_FIN
+ISR_TX_ENVIAR
+    MOVF    TX_OUT,W
+    ADDLW   TX_BUF
+    MOVWF   FSR                 ;FSR = &TX_BUF[TX_OUT]
+    MOVF    INDF,W
+    MOVWF   TXREG               ;Escribir TXREG baja TXIF
+    INCF    TX_OUT,W
+    ANDLW   TX_MASCARA          ;31 + 1 vuelve a 0
+    MOVWF   TX_OUT
+    GOTO    ISR_FIN
+
+;===============================================================================
+; SUBRUTINAS
+;===============================================================================
+;*******************************************************************************
+; @brief    TAREA_10MS: lo que se hace en cada tick de Timer0.
+;*******************************************************************************
+TAREA_10MS
+    MOVLW   ADC_AN1
+    CALL    ADC_LEER            ;W = muestra del sensor de pulso
+    MOVWF   MUESTRA
+    CALL    LEER_BOTON
+    MOVF    ESTADO,W
+    XORLW   EST_MIDIENDO        ;¿Midiendo?
+    BTFSC   STATUS,Z
+    CALL    TAREA_MEDICION
+    BTFSC   FLAGS,F_DEBUG       ;¿Modo depuración?
+    CALL    ENVIAR_MUESTRA
+    CALL    ACTUALIZAR_SALIDAS  ;LED de latido y buzzer
+    INCF    CONT_100MS,F
+    MOVF    CONT_100MS,W
+    XORLW   TICKS_100MS         ;¿Pasaron 100 ms?
+    BTFSS   STATUS,Z
+    RETURN
+    CLRF    CONT_100MS
+    CALL    TAREA_100MS
+    RETURN
+
+;*******************************************************************************
+; @brief    TAREA_100MS: temperatura, alarma y display.
+;*******************************************************************************
+TAREA_100MS
+    MOVLW   ADC_AN0
+    CALL    ADC_LEER            ;W = LM35 (cuentas ~ °C)
+    MOVWF   TEMP_C
+    CALL    EVALUAR_ALARMA
+    MOVF    PRESENT_CONT,F      ;¿Sigue la presentación "G07"?
+    BTFSS   STATUS,Z
+    DECF    PRESENT_CONT,F
+    CALL    ACTUALIZAR_DISPLAY
+    INCF    CONT_500MS,F
+    MOVF    CONT_500MS,W
+    XORLW   BLOQUES_500MS       ;¿Pasaron 500 ms?
+    BTFSS   STATUS,Z
+    RETURN
+    CLRF    CONT_500MS
+    MOVLW   1 << F_FASE
+    XORWF   FLAGS,F             ;Invierte la fase del buzzer intermitente
+    CALL    ENVIAR_TEMP         ;"T=025"
+    RETURN
+
+;*******************************************************************************
+; @brief    TAREA_MEDICION: cada tick mientras se mide.
+;
+; @details  Detecta latidos y lleva la cuenta regresiva de 15 s.
+;*******************************************************************************
+TAREA_MEDICION
+    CALL    DETECTAR_LATIDO
+    INCF    CONT_1S,F
+    MOVF    CONT_1S,W
+    XORLW   TICKS_1S            ;¿Pasó 1 s?
+    BTFSS   STATUS,Z
+    RETURN
+    CLRF    CONT_1S
+    DECFSZ  SEGUNDOS,F          ;Un segundo menos; ¿llegó a 0?
+    GOTO    ENVIAR_MIDIENDO     ;No: "S=1,ss" (vuelve desde ahí)
+    GOTO    FIN_MEDICION        ;Sí: calcular el resultado
+
+;*******************************************************************************
+; @brief    DETECTAR_LATIDO: umbral alto + umbral bajo + tiempo muerto.
+;
+; @details  - Desarmado (F_ARMADO = 0): espera a que la señal baje de
+;             UMBRAL_BAJO y recién ahí se arma.
+;           - Armado: si pasó el tiempo muerto y la señal llega a UMBRAL_ALTO,
+;             cuenta un latido, se desarma y arranca 250 ms de tiempo muerto.
+;           Así, un pico con ruido que cruza el umbral varias veces cuenta
+;           una sola vez.
+;*******************************************************************************
+DETECTAR_LATIDO
+    MOVF    MUERTO_CONT,F
+    BTFSS   STATUS,Z
+    DECF    MUERTO_CONT,F       ;Descuenta el tiempo muerto
+    BTFSC   FLAGS,F_ARMADO
+    GOTO    DL_ARMADO
+    MOVLW   UMBRAL_BAJO
+    SUBWF   MUESTRA,W           ;C = 1 si MUESTRA >= UMBRAL_BAJO
+    BTFSS   STATUS,C
+    BSF     FLAGS,F_ARMADO      ;Bajó del umbral bajo: se arma
+    RETURN
+DL_ARMADO
+    MOVF    MUERTO_CONT,F
+    BTFSS   STATUS,Z            ;¿Terminó el tiempo muerto?
+    RETURN
+    MOVLW   UMBRAL_ALTO
+    SUBWF   MUESTRA,W           ;C = 1 si MUESTRA >= UMBRAL_ALTO
+    BTFSS   STATUS,C
+    RETURN
+    INCF    PULSOS,F            ;¡Latido!
+    BCF     FLAGS,F_ARMADO
+    MOVLW   TIEMPO_MUERTO
+    MOVWF   MUERTO_CONT
+    MOVLW   LED_LAT_TICKS
+    MOVWF   LED_LAT_CONT
+    BSF     LED_LATIDO
+    RETURN
+
+;*******************************************************************************
+; @brief    INICIAR_MEDICION: arranca (o reinicia) una medición de 15 s.
+;*******************************************************************************
+INICIAR_MEDICION
+    MOVLW   EST_MIDIENDO
+    MOVWF   ESTADO
+    MOVLW   VENTANA_SEG
+    MOVWF   SEGUNDOS
+    CLRF    CONT_1S
+    CLRF    PULSOS
+    CLRF    MUERTO_CONT
+    CLRF    PRESENT_CONT        ;Corta la presentación si seguía
+    BCF     FLAGS,F_ARMADO      ;Espera a que la señal baje antes de contar
+    BCF     LED_RESULTADO
+    BCF     LED_RANGO
+    MOVLW   BEEP_TICKS
+    MOVWF   BEEP_CONT           ;Pitido de inicio
+    CALL    ACTUALIZAR_DISPLAY
+    GOTO    ENVIAR_MIDIENDO     ;"S=1,15" (vuelve desde ahí)
+
+;*******************************************************************************
+; @brief    FIN_MEDICION: calcula BPM, evalúa el rango y avisa a la GUI.
+;
+; @details  BPM = PULSOS x 4 (dos rotaciones a la izquierda). Con 250 ms de
+;           tiempo muerto entran como máximo 60 latidos en 15 s: BPM <= 240.
+;*******************************************************************************
+FIN_MEDICION
+    MOVF    PULSOS,W
+    MOVWF   BPM
+    BCF     STATUS,C
+    RLF     BPM,F               ;x 2
+    BCF     STATUS,C
+    RLF     BPM,F               ;x 4
+    MOVLW   EST_RESULTADO
+    MOVWF   ESTADO
+    BSF     LED_RESULTADO
+    MOVLW   BEEP_TICKS
+    MOVWF   BEEP_CONT           ;Pitido de fin
+    MOVF    PULSOS,F            ;Sin latidos: no se evalúa el rango
+    BTFSC   STATUS,Z
+    GOTO    FM_AVISAR
+    MOVLW   BPM_MIN
+    SUBWF   BPM,W               ;C = 0 si BPM < 50
+    BTFSS   STATUS,C
+    BSF     LED_RANGO
+    MOVF    BPM,W
+    SUBLW   BPM_MAX             ;W = 120 - BPM; C = 0 si BPM > 120
+    BTFSS   STATUS,C
+    BSF     LED_RANGO
+FM_AVISAR
+    CALL    ACTUALIZAR_DISPLAY
+    CALL    ENVIAR_BPM          ;"B=072"
+    MOVLW   '2'
+    GOTO    ENVIAR_ESTADO       ;"S=2" (vuelve desde ahí)
+
+;*******************************************************************************
+; @brief    LEER_BOTON: inicia una medición al apretar RB0 (flanco de bajada).
+;
+; @details  Se lee cada 10 ms, lo que ya filtra la mayor parte del rebote.
+;*******************************************************************************
+LEER_BOTON
+    BTFSC   BOTON               ;¿Apretado? (0 = apretado)
+    GOTO    LB_SUELTO
+    BTFSC   FLAGS,F_BOTON_ANT   ;Apretado ahora y suelto antes: flanco
+    CALL    INICIAR_MEDICION
+    BCF     FLAGS,F_BOTON_ANT
+    RETURN
+LB_SUELTO
+    BSF     FLAGS,F_BOTON_ANT
+    RETURN
+
+;*******************************************************************************
+; @brief    PROCESAR_RX: ejecuta la tecla recibida desde la GUI.
+;*******************************************************************************
+PROCESAR_RX
+    BCF     FLAGS,F_RX
+    MOVF    RX_DATO,W
+    XORLW   'A'
+    BTFSC   STATUS,Z
+    GOTO    INICIAR_MEDICION
+    MOVF    RX_DATO,W
+    XORLW   'a'
+    BTFSC   STATUS,Z
+    GOTO    INICIAR_MEDICION
+    MOVF    RX_DATO,W
+    XORLW   '1'
+    BTFSC   STATUS,Z
+    GOTO    PR_TEMP
+    MOVF    RX_DATO,W
+    XORLW   '2'
+    BTFSC   STATUS,Z
+    GOTO    PR_PULSO
+    MOVF    RX_DATO,W
+    XORLW   'D'
+    BTFSC   STATUS,Z
+    GOTO    PR_DEBUG
+    MOVF    RX_DATO,W
+    XORLW   'd'
+    BTFSC   STATUS,Z
+    GOTO    PR_DEBUG
+    RETURN                      ;Otra tecla: se ignora
+PR_TEMP
+    MOVLW   MODO_TEMP
+    MOVWF   MODO
+    GOTO    ACTUALIZAR_DISPLAY
+PR_PULSO
+    MOVLW   MODO_PULSO
+    MOVWF   MODO
+    GOTO    ACTUALIZAR_DISPLAY
+PR_DEBUG
+    MOVLW   1 << F_DEBUG
+    XORWF   FLAGS,F             ;Activa o desactiva el envío de muestras
+    RETURN
+
+;*******************************************************************************
+; @brief    EVALUAR_ALARMA: alarma térmica con histéresis.
+;*******************************************************************************
+EVALUAR_ALARMA
+    BTFSC   FLAGS,F_ALARMA
+    GOTO    EA_ACTIVA
+    MOVLW   ALARMA_ON
+    SUBWF   TEMP_C,W            ;C = 1 si TEMP_C >= 41
+    BTFSS   STATUS,C
+    RETURN
+    BSF     FLAGS,F_ALARMA
+    BSF     LED_ALARMA
+    MOVLW   '1'
+    GOTO    ENVIAR_ALARMA       ;"A=1"
+EA_ACTIVA
+    MOVF    TEMP_C,W
+    SUBLW   ALARMA_OFF          ;W = 40 - TEMP_C; C = 1 si TEMP_C <= 40
+    BTFSS   STATUS,C
+    RETURN
+    BCF     FLAGS,F_ALARMA
+    BCF     LED_ALARMA
+    MOVLW   '0'
+    GOTO    ENVIAR_ALARMA       ;"A=0"
+
+;*******************************************************************************
+; @brief    ACTUALIZAR_SALIDAS: LED de latido y buzzer, cada 10 ms.
+;
+; @details  Buzzer encendido si hay un pitido en curso, o si hay alarma y la
+;           fase de 500 ms está en 1 (intermitente).
+;*******************************************************************************
+ACTUALIZAR_SALIDAS
+    MOVF    LED_LAT_CONT,F
+    BTFSC   STATUS,Z
+    GOTO    AS_BUZZER
+    DECFSZ  LED_LAT_CONT,F
+    GOTO    AS_BUZZER
+    BCF     LED_LATIDO          ;Terminó el destello
+AS_BUZZER
+    MOVF    BEEP_CONT,F
+    BTFSC   STATUS,Z
+    GOTO    AS_SIN_BEEP
+    DECF    BEEP_CONT,F
+    GOTO    AS_BUZZ_ON
+AS_SIN_BEEP
+    BTFSS   FLAGS,F_ALARMA
+    GOTO    AS_BUZZ_OFF
+    BTFSS   FLAGS,F_FASE
+    GOTO    AS_BUZZ_OFF
+AS_BUZZ_ON
+    BSF     BUZZER
+    RETURN
+AS_BUZZ_OFF
+    BCF     BUZZER
+    RETURN
+
+;*******************************************************************************
+; @brief    ADC_LEER: convierte el canal indicado en W (valor de ADCON0).
+;
+; @details  Espera ~20 us de adquisición (necesaria al cambiar de canal),
+;           arranca la conversión y devuelve ADRESH en W.
+;*******************************************************************************
+ADC_LEER
+    MOVWF   ADCON0              ;Elige el canal
+    MOVLW   D'7'
+    MOVWF   ADC_DEMORA
+AL_ADQUISICION
+    DECFSZ  ADC_DEMORA,F        ;7 vueltas x 3 us = ~20 us
+    GOTO    AL_ADQUISICION
+    BSF     ADCON0,GO           ;Arranca la conversión
+AL_ESPERA
+    BTFSC   ADCON0,GO           ;GO vuelve a 0 al terminar
+    GOTO    AL_ESPERA
+    MOVF    ADRESH,W
+    RETURN
+
+;*******************************************************************************
+; @brief    ACTUALIZAR_DISPLAY: elige qué mostrar según estado y modo.
+;
+; @details  Presentación -> "G07"; midiendo -> cuenta regresiva;
+;           modo temperatura -> "t 25"; resultado -> "F072"; espera -> "F---".
+;*******************************************************************************
+ACTUALIZAR_DISPLAY
+    MOVF    PRESENT_CONT,F
+    BTFSS   STATUS,Z
+    GOTO    MOSTRAR_G07
+    MOVF    ESTADO,W
+    XORLW   EST_MIDIENDO
+    BTFSC   STATUS,Z
+    GOTO    MOSTRAR_CUENTA
+    MOVF    MODO,W
+    XORLW   MODO_TEMP
+    BTFSC   STATUS,Z
+    GOTO    MOSTRAR_TEMP
+    MOVF    ESTADO,W
+    XORLW   EST_RESULTADO
+    BTFSC   STATUS,Z
+    GOTO    MOSTRAR_FRECUENCIA
+    GOTO    MOSTRAR_SIN_DATO
+
+MOSTRAR_G07
+    MOVLW   SEG_G
+    MOVWF   DSPL_1
+    MOVLW   D'0'
+    CALL    TABLA_DECO
+    MOVWF   DSPL_2
+    MOVLW   D'7'
+    CALL    TABLA_DECO
+    MOVWF   DSPL_3
+    MOVLW   SEG_APAGADO
+    MOVWF   DSPL_4
+    RETURN
+
+MOSTRAR_CUENTA                  ;"  15" ... "   1"
+    MOVLW   SEG_APAGADO
+    MOVWF   DSPL_1
+    MOVWF   DSPL_2
+    MOVF    SEGUNDOS,W
+    CALL    BIN_A_DEC
+    MOVF    DECENAS,W
+    CALL    DIGITO_O_APAGADO
+    MOVWF   DSPL_3
+    MOVF    UNIDADES,W
+    CALL    TABLA_DECO
+    MOVWF   DSPL_4
+    RETURN
+
+MOSTRAR_TEMP                    ;"t 25"
+    MOVLW   SEG_T
+    MOVWF   DSPL_1
+    MOVF    TEMP_C,W
+    CALL    BIN_A_DEC
+    MOVF    CENTENAS,W
+    CALL    DIGITO_O_APAGADO
+    MOVWF   DSPL_2
+    MOVF    DECENAS,W
+    CALL    TABLA_DECO
+    MOVWF   DSPL_3
+    MOVF    UNIDADES,W
+    CALL    TABLA_DECO
+    MOVWF   DSPL_4
+    RETURN
+
+MOSTRAR_FRECUENCIA              ;"F072" (o "F---" sin latidos)
+    MOVF    PULSOS,F
+    BTFSC   STATUS,Z
+    GOTO    MOSTRAR_SIN_DATO
+    MOVLW   SEG_F
+    MOVWF   DSPL_1
+    MOVF    BPM,W
+    CALL    BIN_A_DEC
+    MOVF    CENTENAS,W
+    CALL    TABLA_DECO
+    MOVWF   DSPL_2
+    MOVF    DECENAS,W
+    CALL    TABLA_DECO
+    MOVWF   DSPL_3
+    MOVF    UNIDADES,W
+    CALL    TABLA_DECO
+    MOVWF   DSPL_4
+    RETURN
+
+MOSTRAR_SIN_DATO                ;"F---"
+    MOVLW   SEG_F
+    MOVWF   DSPL_1
+    MOVLW   SEG_GUION
+    MOVWF   DSPL_2
+    MOVWF   DSPL_3
+    MOVWF   DSPL_4
+    RETURN
+
+;*******************************************************************************
+; @brief    DIGITO_O_APAGADO: como TABLA_DECO, pero un 0 se muestra apagado.
+;*******************************************************************************
+DIGITO_O_APAGADO
+    ANDLW   0xFF                ;Z = 1 si W = 0
+    BTFSC   STATUS,Z
+    RETLW   SEG_APAGADO
+    GOTO    TABLA_DECO
+
+;*******************************************************************************
+; @brief    BIN_A_DEC: separa W (0-255) en CENTENAS, DECENAS y UNIDADES
+;           por restas sucesivas.
+;*******************************************************************************
+BIN_A_DEC
+    MOVWF   BCD_AUX
+    CLRF    CENTENAS
+    CLRF    DECENAS
+BD_CENTENAS
+    MOVLW   D'100'
+    SUBWF   BCD_AUX,W           ;C = 1 si BCD_AUX >= 100
+    BTFSS   STATUS,C
+    GOTO    BD_DECENAS
+    MOVWF   BCD_AUX
+    INCF    CENTENAS,F
+    GOTO    BD_CENTENAS
+BD_DECENAS
+    MOVLW   D'10'
+    SUBWF   BCD_AUX,W
+    BTFSS   STATUS,C
+    GOTO    BD_UNIDADES
+    MOVWF   BCD_AUX
+    INCF    DECENAS,F
+    GOTO    BD_DECENAS
+BD_UNIDADES
+    MOVF    BCD_AUX,W
+    MOVWF   UNIDADES
+    RETURN
+
+;*******************************************************************************
+; @brief    Tramas hacia la GUI. Todas terminan con UART_CRLF.
+;*******************************************************************************
+ENVIAR_TEMP                     ;"T=025"
+    MOVLW   'T'
+    CALL    UART_PUT
+    MOVLW   '='
+    CALL    UART_PUT
+    MOVF    TEMP_C,W
+    CALL    UART_3DIG
+    GOTO    UART_CRLF
+
+ENVIAR_BPM                      ;"B=072"
+    MOVLW   'B'
+    CALL    UART_PUT
+    MOVLW   '='
+    CALL    UART_PUT
+    MOVF    BPM,W
+    CALL    UART_3DIG
+    GOTO    UART_CRLF
+
+ENVIAR_MUESTRA                  ;"P=128", una de cada dos muestras (50 Hz)
+    MOVLW   1 << F_DIV
+    XORWF   FLAGS,F
+    BTFSS   FLAGS,F_DIV
+    RETURN
+    MOVLW   'P'
+    CALL    UART_PUT
+    MOVLW   '='
+    CALL    UART_PUT
+    MOVF    MUESTRA,W
+    CALL    UART_3DIG
+    GOTO    UART_CRLF
+
+ENVIAR_MIDIENDO                 ;"S=1,ss"
+    MOVLW   'S'
+    CALL    UART_PUT
+    MOVLW   '='
+    CALL    UART_PUT
+    MOVLW   '1'
+    CALL    UART_PUT
+    MOVLW   ','
+    CALL    UART_PUT
+    MOVF    SEGUNDOS,W
+    CALL    BIN_A_DEC
+    MOVF    DECENAS,W
+    ADDLW   '0'
+    CALL    UART_PUT
+    MOVF    UNIDADES,W
+    ADDLW   '0'
+    CALL    UART_PUT
+    CALL    ACTUALIZAR_DISPLAY
+    GOTO    UART_CRLF
+
+ENVIAR_ESTADO                   ;"S=" + W ('0' o '2')
+    MOVWF   TX_CHAR
+    MOVLW   'S'
+    GOTO    ENVIAR_PAR
+
+ENVIAR_ALARMA                   ;"A=" + W ('0' o '1')
+    MOVWF   TX_CHAR
+    MOVLW   'A'
+ENVIAR_PAR                      ;Letra en W, valor en TX_CHAR
+    MOVWF   BCD_AUX             ;(TX_CHAR lo usa UART_PUT)
+    MOVF    TX_CHAR,W
+    MOVWF   UNIDADES
+    MOVF    BCD_AUX,W
+    CALL    UART_PUT
+    MOVLW   '='
+    CALL    UART_PUT
+    MOVF    UNIDADES,W
+    CALL    UART_PUT
+    GOTO    UART_CRLF
+
+;*******************************************************************************
+; @brief    UART_3DIG: encola W (0-255) como tres dígitos ASCII.
+;*******************************************************************************
+UART_3DIG
+    CALL    BIN_A_DEC
+    MOVF    CENTENAS,W
+    ADDLW   '0'                 ;Número -> carácter ASCII
+    CALL    UART_PUT
+    MOVF    DECENAS,W
+    ADDLW   '0'
+    CALL    UART_PUT
+    MOVF    UNIDADES,W
+    ADDLW   '0'
+    GOTO    UART_PUT
+
+;*******************************************************************************
+; @brief    UART_CRLF: encola el fin de trama "\r\n".
+;*******************************************************************************
+UART_CRLF
+    MOVLW   0x0D                ;\r
+    CALL    UART_PUT
+    MOVLW   0x0A                ;\n
+    GOTO    UART_PUT
+
+;*******************************************************************************
+; @brief    UART_PUT: agrega W al buffer circular y habilita TXIE.
+;
+; @details  No espera a que salga el carácter: lo envía ISR_TX. Si el buffer
+;           está lleno, el carácter se descarta.
+;*******************************************************************************
+UART_PUT
+    MOVWF   TX_CHAR
+    INCF    TX_IN,W
+    ANDLW   TX_MASCARA
+    MOVWF   TX_SIG              ;Posición siguiente a TX_IN
+    XORWF   TX_OUT,W            ;¿Alcanzaría a TX_OUT?
+    BTFSC   STATUS,Z
+    RETURN                      ;Lleno: se descarta
+    MOVF    TX_IN,W
+    ADDLW   TX_BUF
+    MOVWF   FSR
+    BCF     STATUS,IRP
+    MOVF    TX_CHAR,W
+    MOVWF   INDF                ;TX_BUF[TX_IN] = carácter
+    MOVF    TX_SIG,W
+    MOVWF   TX_IN               ;Recién ahora queda visible para la ISR
+    BANKSEL PIE1
+    BSF     PIE1,TXIE           ;Pide la interrupción de transmisión
+    BANKSEL FLAGS
+    RETURN
+
+;===============================================================================
+; TABLA DE SEGMENTOS (código de la placa)
+;===============================================================================
+; Ubicada en 0x0400 para que ADDWF PCL no cruce un límite de 256 palabras.
+; Carga PCLATH antes del salto; los CALL y GOTO del resto del programa no se
+; ven afectados porque todo el código está por debajo de 0x0800.
+;*******************************************************************************
+; @brief    TABLA_DECO: dígito (W = 0-9) -> segmentos (ánodo común).
+;*******************************************************************************
+    ORG     0x0400
+TABLA_DECO
+    MOVWF   TBL_IDX
+    MOVLW   HIGH TABLA_DECO
+    MOVWF   PCLATH
+    MOVF    TBL_IDX,W
+    ADDWF   PCL,F
+    RETLW   0xC0                ;0
+    RETLW   0xF9                ;1
+    RETLW   0xA4                ;2
+    RETLW   0xB0                ;3
+    RETLW   0x99                ;4
+    RETLW   0x92                ;5
+    RETLW   0x82                ;6
+    RETLW   0xF8                ;7
+    RETLW   0x80                ;8
+    RETLW   0x90                ;9
 
 ;===============================================================================
     END
