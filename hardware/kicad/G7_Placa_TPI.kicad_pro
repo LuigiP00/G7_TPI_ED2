@@ -69,7 +69,13 @@
           "thermal_relief_spoke_width": 0.5
         }
       },
-      "diff_pair_dimensions": [],
+      "diff_pair_dimensions": [
+        {
+          "gap": 0.0,
+          "via_gap": 0.0,
+          "width": 0.0
+        }
+      ],
       "drc_exclusions": [],
       "meta": {
         "version": 2
@@ -206,7 +212,11 @@
           "td_width_to_size_filter_ratio": 0.9
         }
       ],
-      "track_widths": [],
+      "track_widths": [
+        0.0,
+        1.0,
+        1.5
+      ],
       "tuning_pattern_settings": {
         "diff_pair_defaults": {
           "corner_radius_percentage": 80,
@@ -233,7 +243,12 @@
           "spacing": 0.6
         }
       },
-      "via_dimensions": [],
+      "via_dimensions": [
+        {
+          "diameter": 0.0,
+          "drill": 0.0
+        }
+      ],
       "zones_allow_external_fillets": false
     },
     "ipc2581": {
@@ -492,7 +507,7 @@
     "pinned_symbol_libs": []
   },
   "meta": {
-    "filename": "Esquemático placa TPI.kicad_pro",
+    "filename": "G7_Placa_TPI.kicad_pro",
     "version": 3
   },
   "net_settings": {
@@ -660,18 +675,18 @@
     "subpart_id_separator": 0,
     "top_level_sheets": [
       {
-        "filename": "Esquemático placa TPI.kicad_sch",
-        "name": "Esquemático placa TPI",
+        "filename": "G7_Placa_TPI.kicad_sch",
+        "name": "G7_Placa_TPI",
         "uuid": "09d807ff-900c-41ab-95df-5e5956160721"
       }
     ],
-    "used_designators": "#FLG1-2,#PWR1-18,BZ1,C1-8,D1,J1-2,Q1-5,R1-27,SW1-2,U1-3,Y1",
+    "used_designators": "#FLG1-2,#PWR1-20,BZ1,C1-8,D1-3,J1-2,Q1-5,R1-27,SW1-2,U1-3,Y1",
     "variants": []
   },
   "sheets": [
     [
       "09d807ff-900c-41ab-95df-5e5956160721",
-      "prueba"
+      "G7_Placa_TPI"
     ]
   ],
   "text_variables": {},
