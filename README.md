@@ -12,12 +12,13 @@ Sistema basado en el **PIC16F887** (cristal de 4 MHz, Assembler MPASM) que mide 
 | Carpeta | Contenido |
 | --- | --- |
 | `anteproyecto/` | Anteproyecto entregado (`G7_AP_TPI_ED2`) y diagramas de bloques en draw.io |
-| `hardware/kicad/` | Esquemático y PCB en KiCad |
+| `informe/` | Borrador del informe final |
+| `hardware/kicad/` | Esquemático y PCB en KiCad (`G7_Placa_TPI.kicad_pro`) |
 | `hardware/datasheets/` | Hojas de datos de los componentes |
-| `firmware/` | Código Assembler del SEP (`G7_TPI_ED2.asm`) |
-| `firmware/pruebas/` | Programas de prueba de la placa |
-| `gui/` | Interfaz gráfica para la PC (Python) |
-| `docs/` | Protocolo serie y notas de diseño |
+| `firmware/` | Código Assembler del SEP (`G7_TPI_ED2.asm`, v4.0) |
+| `firmware/pruebas/` | Programas de prueba de la placa y versiones anteriores |
+| `gui/` | Interfaz gráfica web para la PC (`index.html`, Web Serial) |
+| `docs/` | Protocolo serie y diagrama de bloques del SEP para el informe (`docs/diagramas/`) |
 
 ## Firmware: cómo compilar y cargar
 
@@ -32,15 +33,16 @@ Los `.asm` están codificados en **Windows-1252**, igual que la plantilla de la 
 | Pin | Señal |
 | --- | --- |
 | RA0 / AN0 | LM35 |
-| RA1 / AN1 | Sensor de pulso (HW-827 / XD-58C, divisor 22 kΩ / 22 kΩ) |
+| RA1 / AN1 | Sensor de pulso HW-827 (divisor 22 kΩ / 22 kΩ) |
 | RA3 / VREF+ | Referencia del ADC: 2,50 V |
-| RA4 | Buzzer (vía BC337) |
-| RB0 | Botón de inicio de medición (pull-up interna) |
-| RB1 / RB2 | LED de latido / LED de resultado listo |
-| RE0 / RE1 | LED de alarma térmica / LED de frecuencia fuera de rango |
+| RB6 | LED verde (temperatura normal) |
+| RB7 | LED rojo (alarma térmica) |
 | RC0–RC3 | Dígitos del display (PNP BC557, ánodo común) |
+| RC4 | Buzzer (vía BC337) |
 | RD0–RD6 | Segmentos a–g |
 | RC6 / RC7 | TX / RX hacia el CP2102 |
+
+La medición de pulso se inicia desde la PC (tecla `I` en la GUI); la placa no tiene botón de inicio.
 
 ## Protocolo serie
 
@@ -50,8 +52,9 @@ Los `.asm` están codificados en **Windows-1252**, igual que la plantilla de la 
 
 | Parte | Estado |
 | --- | --- |
-| Anteproyecto | Entregado |
-| Firmware v0.4: display, LM35 con alarma, EUSART, máquina de estados, conteo de latidos | Probado en simulador; falta probar en la placa |
-| Ajuste de umbrales con el sensor real | Pendiente |
-| GUI | En desarrollo |
-| PCB / placa perforada | En diseño |
+| Anteproyecto | Aprobado (diagrama de bloques rehecho con el formato de la cátedra en `docs/diagramas/`) |
+| Placa | Fabricada y probada |
+| Firmware v4.0: temperatura con alarma, conteo de pulso de 15 s, display, EUSART | Funcionando en la placa |
+| GUI web | Funcionando |
+| Calibración del pulso contra una referencia (oxímetro o conteo manual) | Pendiente |
+| Informe final | En redacción (`informe/`) |
