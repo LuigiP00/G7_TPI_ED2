@@ -1,0 +1,730 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pulsómetro G7 · Monitor</title>
+<!--
+  GUI del SEP "Pulsómetro digital con alarma térmica" - Grupo 7, ED2 (FCEFyN - UNC)
+
+  Se comunica con el PIC16F887 por el puerto serie usando la Web Serial API
+  (solo Google Chrome o Microsoft Edge).
+
+  Protocolo (ver docs/protocolo_serie.md):
+    PIC -> PC : "Txx,Myy,Bzzz\r\n" cada ~250 ms
+                Txx  = temperatura en °C
+                Myy  = segundos restantes de la medición de pulso (00 = sin medición)
+                Bzzz = última frecuencia cardíaca en BPM (000 = sin resultado)
+    PC -> PIC : 'I' inicia la medición de pulso (15 s)
+                'V' alterna el display físico entre temperatura y frecuencia
+
+  Modo demo: simula las tramas del PIC para probar la interfaz sin la placa.
+-->
+<style>
+  :root {
+    --bg: #070b10;
+    --panel: #0e151d;
+    --panel-2: #131c26;
+    --line: #1f2c3a;
+    --text: #e6edf3;
+    --muted: #7d8b99;
+    --dim: #4a5866;
+    --temp: #ffb547;
+    --pulse: #ff4d6d;
+    --ok: #3ddc97;
+    --warn: #ffb547;
+    --alarm: #ff3b3b;
+    --accent: #4da3ff;
+    --seg-on: #ff3b30;
+    --seg-off: #2a1414;
+    --mono: "Cascadia Mono", "Consolas", "SF Mono", "Menlo", monospace;
+    --sans: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    background-image: radial-gradient(ellipse at top, #0d1722 0%, var(--bg) 60%);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    padding: 20px 16px 32px;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+
+  /* ---------- Encabezado ---------- */
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo {
+    width: 42px; height: 42px; border-radius: 11px; display: grid; place-items: center;
+    background: linear-gradient(135deg, #2a0f16, #3a1420); border: 1px solid #4a1a26;
+  }
+  .brand h1 { font-size: 1.15rem; font-weight: 650; letter-spacing: 0.01em; }
+  .brand p { font-size: 0.78rem; color: var(--muted); font-family: var(--mono); margin-top: 2px; }
+  .conn { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px; font-size: 0.8rem; font-weight: 600;
+    padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); color: var(--muted);
+  }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  .pill.on { color: var(--ok); border-color: #1e4d3a; }
+  .pill.on .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .pill.demo { color: var(--accent); border-color: #1d3a5c; }
+  .pill.demo .dot { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+
+  button {
+    font-family: var(--sans); font-size: 0.88rem; font-weight: 600; cursor: pointer;
+    border-radius: 10px; padding: 9px 16px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--text); transition: background .15s, border-color .15s, transform .08s;
+  }
+  button:hover:not(:disabled) { background: #1a2532; border-color: #2c3d50; }
+  button:active:not(:disabled) { transform: scale(0.98); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #031222; }
+  button.primary:hover:not(:disabled) { background: #6cb4ff; }
+  button.go { background: var(--pulse); border-color: var(--pulse); color: #2a0008; }
+  button.go:hover:not(:disabled) { background: #ff6b85; }
+  kbd {
+    font-family: var(--mono); font-size: 0.72rem; padding: 1px 6px; border-radius: 5px; margin-left: 6px;
+    border: 1px solid rgba(255,255,255,0.25); opacity: 0.8;
+  }
+
+  /* ---------- Banner de alarma ---------- */
+  .alarm-banner {
+    display: none; align-items: center; justify-content: center; gap: 12px;
+    padding: 12px 16px; border-radius: 12px; font-weight: 700; letter-spacing: 0.04em;
+    background: rgba(255, 59, 59, 0.12); border: 1px solid var(--alarm); color: #ff8a8a;
+    animation: blink 1s steps(2, start) infinite;
+  }
+  .alarm-banner.show { display: flex; }
+  @keyframes blink { 50% { background: rgba(255, 59, 59, 0.28); } }
+
+  /* ---------- Paneles ---------- */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 18px 20px;
+    position: relative; overflow: hidden;
+  }
+  .panel.alarm { border-color: var(--alarm); box-shadow: 0 0 0 1px var(--alarm), 0 0 30px rgba(255,59,59,0.18); }
+  .panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+  .label { font-size: 0.74rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+  .chip {
+    font-size: 0.74rem; font-weight: 700; padding: 4px 10px; border-radius: 999px;
+    background: rgba(125,139,153,0.12); color: var(--muted);
+  }
+  .chip.ok { background: rgba(61,220,151,0.12); color: var(--ok); }
+  .chip.warn { background: rgba(255,181,71,0.14); color: var(--warn); }
+  .chip.alarm { background: rgba(255,59,59,0.16); color: var(--alarm); }
+  .chip.info { background: rgba(77,163,255,0.14); color: var(--accent); }
+
+  .readout { display: flex; align-items: flex-end; gap: 10px; margin: 6px 0 4px; }
+  .big {
+    font-family: var(--mono); font-size: clamp(3.6rem, 9vw, 5.4rem); font-weight: 700; line-height: 0.95;
+    font-variant-numeric: tabular-nums; letter-spacing: -0.03em;
+  }
+  .unit { font-size: 1.3rem; color: var(--muted); font-weight: 600; padding-bottom: 8px; }
+  .temp .big { color: var(--temp); text-shadow: 0 0 24px rgba(255,181,71,0.25); }
+  .pulse .big { color: var(--pulse); text-shadow: 0 0 24px rgba(255,77,109,0.25); }
+  .temp.alarm .big { color: var(--alarm); }
+  .sub { font-size: 0.8rem; color: var(--muted); font-family: var(--mono); }
+
+  canvas { display: block; width: 100%; height: 120px; margin-top: 12px; }
+
+  /* Corazón y anillo de progreso */
+  .pulse-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .ring { position: relative; width: 112px; height: 112px; flex: none; }
+  .ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+  .ring .track { stroke: var(--panel-2); }
+  .ring .bar { stroke: var(--pulse); stroke-linecap: round; transition: stroke-dashoffset .3s linear; }
+  .ring .heart {
+    position: absolute; inset: 0; display: grid; place-items: center;
+  }
+  .heart svg { width: 44px; height: 44px; transform: none; fill: var(--pulse); filter: drop-shadow(0 0 8px rgba(255,77,109,0.5)); }
+  .beat { animation: beat var(--beat, 1s) ease-out infinite; }
+  @keyframes beat {
+    0% { transform: scale(1); } 14% { transform: scale(1.22); } 28% { transform: scale(1); }
+    42% { transform: scale(1.12); } 70%, 100% { transform: scale(1); }
+  }
+  .scale { margin-top: 14px; }
+  .scale-bar {
+    position: relative; height: 8px; border-radius: 999px;
+    background: linear-gradient(90deg, #4da3ff 0%, #4da3ff 14.3%, #3ddc97 14.3%, #3ddc97 42.9%, #ffb547 42.9%, #ff3b3b 100%);
+    opacity: 0.85;
+  }
+  .scale-mark {
+    position: absolute; top: -5px; width: 4px; height: 18px; border-radius: 2px; background: #fff;
+    box-shadow: 0 0 6px rgba(255,255,255,0.7); transform: translateX(-2px); transition: left .4s; display: none;
+  }
+  .scale-labels { position: relative; height: 14px; font-size: 0.68rem; color: var(--dim); font-family: var(--mono); margin-top: 6px; }
+
+  /* ---------- Display físico (réplica) ---------- */
+  .bottom { display: grid; grid-template-columns: 1.05fr 1fr; gap: 16px; }
+  @media (max-width: 820px) { .bottom { grid-template-columns: 1fr; } }
+  .seg-box {
+    margin-top: 10px; padding: 14px; border-radius: 12px; background: #0a0606; border: 1px solid #2a1414;
+    display: flex; justify-content: center; gap: 10px;
+  }
+  .digit { width: 46px; height: 80px; }
+  .digit polygon { fill: var(--seg-off); transition: fill .08s; }
+  .digit polygon.on { fill: var(--seg-on); filter: drop-shadow(0 0 4px rgba(255,59,48,0.8)); }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+  .hint { font-size: 0.75rem; color: var(--dim); margin-top: 10px; line-height: 1.45; }
+
+  /* ---------- Historial ---------- */
+  table { width: 100%; border-collapse: collapse; font-size: 0.86rem; margin-top: 8px; }
+  th { text-align: left; font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); font-weight: 700; padding: 6px 4px; border-bottom: 1px solid var(--line); }
+  td { padding: 8px 4px; border-bottom: 1px solid #141e28; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  td.bpm { color: var(--pulse); font-weight: 700; }
+  .empty { color: var(--dim); font-size: 0.84rem; padding: 18px 0 6px; text-align: center; }
+  .hist-scroll { max-height: 210px; overflow-y: auto; }
+
+  /* ---------- Consola ---------- */
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 12px 20px; }
+  summary { cursor: pointer; font-size: 0.8rem; color: var(--muted); font-weight: 600; }
+  .log {
+    margin-top: 10px; font-family: var(--mono); font-size: 0.78rem; color: #9fb0c0;
+    background: #05080b; border-radius: 10px; padding: 10px 12px; height: 150px; overflow-y: auto; white-space: pre;
+  }
+  .log .tx { color: var(--accent); }
+  .log .err { color: var(--alarm); }
+  footer { text-align: center; font-size: 0.72rem; color: var(--dim); margin-top: 4px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .beat, .alarm-banner { animation: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <div class="logo">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ff4d6d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 12h4l2-5 4 10 2-5h8"/>
+        </svg>
+      </div>
+      <div>
+        <h1>Pulsómetro digital con alarma térmica</h1>
+        <p>G7 · PIC16F887 · LM35 (AN0) · HW-827 (AN1) · 9600 8N1</p>
+      </div>
+    </div>
+    <div class="conn">
+      <span id="connPill" class="pill"><span class="dot"></span><span id="connText">Desconectado</span></span>
+      <button id="btnDemo">Modo demo</button>
+      <button id="btnConnect" class="primary">Conectar PIC</button>
+    </div>
+  </header>
+
+  <div id="alarmBanner" class="alarm-banner" role="alert">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 1 21h22L12 2zm1 15h-2v-2h2v2zm0-4h-2V9h2v4z"/></svg>
+    <span id="alarmText">ALARMA TÉRMICA: TEMPERATURA MAYOR A 40 °C</span>
+  </div>
+
+  <div class="grid">
+    <!-- Temperatura -->
+    <section id="tempPanel" class="panel temp">
+      <div class="panel-head">
+        <span class="label">Temperatura</span>
+        <span id="tempChip" class="chip">Sin datos</span>
+      </div>
+      <div class="readout">
+        <span id="tempVal" class="big">--</span>
+        <span class="unit">°C</span>
+      </div>
+      <div id="tempStats" class="sub">mín -- · máx -- · umbral 40 °C</div>
+      <canvas id="tempChart"></canvas>
+    </section>
+
+    <!-- Frecuencia cardíaca -->
+    <section class="panel pulse">
+      <div class="panel-head">
+        <span class="label">Frecuencia cardíaca</span>
+        <span id="pulseChip" class="chip">Listo para medir</span>
+      </div>
+      <div class="pulse-row">
+        <div>
+          <div class="readout">
+            <span id="bpmVal" class="big">---</span>
+            <span id="bpmUnit" class="unit">BPM</span>
+          </div>
+          <div id="pulseSub" class="sub">Ventana de 15 s · latidos × 4</div>
+        </div>
+        <div class="ring">
+          <svg viewBox="0 0 120 120">
+            <circle class="track" cx="60" cy="60" r="52" fill="none" stroke-width="9"/>
+            <circle id="ringBar" class="bar" cx="60" cy="60" r="52" fill="none" stroke-width="9"
+                    stroke-dasharray="326.73" stroke-dashoffset="326.73"/>
+          </svg>
+          <div class="heart">
+            <svg id="heartIcon" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+          </div>
+        </div>
+      </div>
+      <div class="scale">
+        <div class="scale-bar"><div id="scaleMark" class="scale-mark"></div></div>
+        <div class="scale-labels"><span style="position:absolute;left:0">40</span><span style="position:absolute;left:14.3%;transform:translateX(-50%)">60</span><span style="position:absolute;left:42.9%;transform:translateX(-50%)">100</span><span style="position:absolute;right:0">180 BPM</span></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="bottom">
+    <!-- Réplica del display físico + comandos -->
+    <section class="panel">
+      <div class="panel-head">
+        <span class="label">Display de la placa</span>
+        <span id="dispChip" class="chip info">Temperatura</span>
+      </div>
+      <div id="segBox" class="seg-box"></div>
+      <div class="controls">
+        <button id="btnMeasure" class="go" disabled>Medir pulso<kbd>I</kbd></button>
+        <button id="btnToggle" disabled>Alternar display<kbd>V</kbd></button>
+      </div>
+      <p class="hint">Apoyá la yema del dedo sobre el sensor, sin apretar, unos segundos antes de medir y no la muevas durante los 15 s.
+        La réplica del display sigue los comandos enviados desde esta ventana.</p>
+    </section>
+
+    <!-- Historial de mediciones -->
+    <section class="panel">
+      <div class="panel-head">
+        <span class="label">Historial de la sesión</span>
+        <button id="btnCsv" disabled style="padding:5px 12px;font-size:0.78rem">Exportar CSV</button>
+      </div>
+      <div class="hist-scroll">
+        <table>
+          <thead><tr><th>Hora</th><th>BPM</th><th>Temp.</th><th>Estado</th></tr></thead>
+          <tbody id="histBody"></tbody>
+        </table>
+        <div id="histEmpty" class="empty">Todavía no hay mediciones.</div>
+      </div>
+    </section>
+  </div>
+
+  <details>
+    <summary>Consola serie · última trama: <span id="lastFrame" style="font-family:var(--mono)">---</span></summary>
+    <div id="log" class="log"></div>
+  </details>
+
+  <footer>Electrónica Digital II · FCEFyN – UNC · Grupo 7</footer>
+</div>
+
+<script>
+/* =====================================================================
+   Estado general
+   ===================================================================== */
+const TEMP_UMBRAL = 40;          // °C, igual que en el firmware
+const MEAS_SECONDS = 15;         // duración de la medición en el firmware
+const HIST_POINTS = 240;         // 240 tramas x 250 ms = 60 s de gráfico
+
+const state = {
+  link: null,                    // 'serial' | 'demo' | null
+  temp: null,
+  tempMin: null,
+  tempMax: null,
+  tempHist: [],
+  measSec: 0,                    // segundos restantes (Myy)
+  bpm: 0,                        // último resultado (Bzzz)
+  dispMode: 'temp',              // lo que muestra el display físico: 'temp' | 'freq'
+  results: []                    // historial de mediciones
+};
+
+const $ = (id) => document.getElementById(id);
+
+/* =====================================================================
+   Comunicación serie (Web Serial API)
+   ===================================================================== */
+let port = null, reader = null, writer = null;
+let readableClosed = null, writableClosed = null;
+
+async function connectSerial() {
+  if (!('serial' in navigator)) {
+    logLine('Este navegador no soporta Web Serial. Abrí la página con Chrome o Edge.', 'err');
+    alertBox('Este navegador no soporta Web Serial.\nAbrí la página con Google Chrome o Microsoft Edge.');
+    return;
+  }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1 });
+
+    const encoder = new TextEncoderStream();
+    writableClosed = encoder.readable.pipeTo(port.writable);
+    writer = encoder.writable.getWriter();
+
+    setLink('serial');
+    logLine('Puerto abierto a 9600 bps.');
+    readLoop();
+  } catch (err) {
+    logLine('No se pudo abrir el puerto: ' + err.message, 'err');
+    port = null;
+  }
+}
+
+async function readLoop() {
+  const decoder = new TextDecoderStream();
+  readableClosed = port.readable.pipeTo(decoder.writable).catch(() => {});
+  reader = decoder.readable.getReader();
+  let buffer = '';
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += value;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop();
+      lines.forEach((l) => { if (l.trim()) handleFrame(l.trim()); });
+    }
+  } catch (err) {
+    logLine('Lectura interrumpida: ' + err.message, 'err');
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function disconnectSerial() {
+  // Para cerrar el puerto primero hay que cancelar la lectura pendiente y
+  // cerrar la escritura; si no, port.close() falla porque los streams siguen tomados.
+  try {
+    if (reader) { await reader.cancel(); await readableClosed; reader = null; }
+    if (writer) { await writer.close(); await writableClosed; writer = null; }
+    if (port) { await port.close(); }
+  } catch (err) {
+    logLine('Error al cerrar: ' + err.message, 'err');
+  }
+  port = null;
+  setLink(null);
+  logLine('Puerto cerrado.');
+}
+
+if ('serial' in navigator) {
+  navigator.serial.addEventListener('disconnect', (e) => {
+    if (port && e.target === port) {
+      logLine('Se desconectó el adaptador USB.', 'err');
+      port = null; reader = null; writer = null;
+      setLink(null);
+    }
+  });
+}
+
+async function sendCmd(ch) {
+  if (state.link === 'demo') { demo.command(ch); }
+  else if (writer) {
+    try { await writer.write(ch); } catch (err) { logLine('Error al enviar: ' + err.message, 'err'); return; }
+  } else return;
+  logLine('> ' + ch, 'tx');
+
+  // El firmware pasa el display a frecuencia con 'I' y lo alterna con 'V'
+  if (ch === 'I') state.dispMode = 'freq';
+  if (ch === 'V') state.dispMode = state.dispMode === 'temp' ? 'freq' : 'temp';
+  renderDisplay();
+}
+
+/* =====================================================================
+   Interpretación de tramas "Txx,Myy,Bzzz"
+   ===================================================================== */
+function handleFrame(line) {
+  $('lastFrame').textContent = line;
+  logLine(line);
+  const m = line.match(/^T(\d{2}),M(\d{2}),B(\d{3})$/);
+  if (!m) return;
+
+  const temp = parseInt(m[1], 10);
+  const sec = parseInt(m[2], 10);
+  const bpm = parseInt(m[3], 10);
+
+  // Fin de medición: Myy pasa de > 0 a 00. Esa trama ya trae el BPM nuevo.
+  if (state.measSec > 0 && sec === 0) addResult(bpm, temp);
+
+  state.temp = temp;
+  state.measSec = sec;
+  state.bpm = bpm;
+  state.tempMin = state.tempMin === null ? temp : Math.min(state.tempMin, temp);
+  state.tempMax = state.tempMax === null ? temp : Math.max(state.tempMax, temp);
+  state.tempHist.push(temp);
+  if (state.tempHist.length > HIST_POINTS) state.tempHist.shift();
+
+  renderTemp();
+  renderPulse();
+  renderDisplay();
+}
+
+function addResult(bpm, temp) {
+  const t = new Date();
+  state.results.unshift({ hora: t.toLocaleTimeString('es-AR'), fecha: t.toLocaleDateString('es-AR'), bpm, temp });
+  renderHistory();
+}
+
+/* =====================================================================
+   Clasificación (referencias generales en reposo, solo orientativas)
+   ===================================================================== */
+function bpmClass(bpm) {
+  if (bpm === 0) return { txt: 'Sin pulsos detectados', cls: 'warn' };
+  if (bpm < 60) return { txt: 'Bajo (< 60)', cls: 'info' };
+  if (bpm <= 100) return { txt: 'Normal en reposo', cls: 'ok' };
+  return { txt: 'Alto (> 100)', cls: 'warn' };
+}
+function tempClass(t) {
+  if (t > TEMP_UMBRAL) return { txt: 'ALARMA', cls: 'alarm' };
+  if (t === TEMP_UMBRAL) return { txt: 'En el umbral', cls: 'warn' };
+  return { txt: 'Normal', cls: 'ok' };
+}
+
+/* =====================================================================
+   Dibujo de la interfaz
+   ===================================================================== */
+function renderTemp() {
+  const t = state.temp;
+  $('tempVal').textContent = t === null ? '--' : t;
+  const c = t === null ? { txt: 'Sin datos', cls: '' } : tempClass(t);
+  $('tempChip').textContent = c.txt;
+  $('tempChip').className = 'chip ' + c.cls;
+  const alarm = t !== null && t > TEMP_UMBRAL;
+  $('tempPanel').classList.toggle('alarm', alarm);
+  $('alarmBanner').classList.toggle('show', alarm);
+  if (alarm) $('alarmText').textContent = `ALARMA TÉRMICA: ${t} °C (umbral ${TEMP_UMBRAL} °C)`;
+  $('tempStats').textContent = state.tempMin === null ? 'mín -- · máx -- · umbral 40 °C'
+    : `mín ${state.tempMin} · máx ${state.tempMax} · umbral ${TEMP_UMBRAL} °C`;
+  drawChart();
+}
+
+function renderPulse() {
+  const sec = state.measSec, bpm = state.bpm;
+  const bar = $('ringBar');
+  const C = 326.73; // 2·π·52
+  const heart = $('heartIcon');
+
+  if (sec > 0) {
+    $('bpmVal').textContent = String(sec).padStart(2, '0');
+    $('bpmUnit').textContent = 's';
+    $('pulseChip').textContent = 'Midiendo…';
+    $('pulseChip').className = 'chip warn';
+    $('pulseSub').textContent = `Faltan ${sec} s · no muevas el dedo`;
+    bar.style.strokeDashoffset = C * (sec / MEAS_SECONDS);
+    heart.classList.add('beat');
+    heart.style.setProperty('--beat', '0.9s');
+    $('btnMeasure').disabled = true;
+  } else {
+    bar.style.strokeDashoffset = C;
+    $('bpmUnit').textContent = 'BPM';
+    $('btnMeasure').disabled = !state.link;
+    if (bpm > 0) {
+      $('bpmVal').textContent = bpm;
+      const c = bpmClass(bpm);
+      $('pulseChip').textContent = c.txt;
+      $('pulseChip').className = 'chip ' + c.cls;
+      $('pulseSub').textContent = `Resolución ±4 BPM · ${bpm / 4} latidos en 15 s`;
+      heart.classList.add('beat');
+      heart.style.setProperty('--beat', (60 / bpm).toFixed(2) + 's');  // late al ritmo medido
+    } else {
+      $('bpmVal').textContent = '---';
+      $('pulseChip').textContent = state.results.length ? 'Sin pulsos detectados' : 'Listo para medir';
+      $('pulseChip').className = 'chip ' + (state.results.length ? 'warn' : '');
+      $('pulseSub').textContent = 'Ventana de 15 s · latidos × 4';
+      heart.classList.remove('beat');
+    }
+  }
+  // Marca en la escala 40-180 BPM
+  const mark = $('scaleMark');
+  if (bpm > 0 && sec === 0) {
+    const pct = Math.max(0, Math.min(100, (bpm - 40) / (180 - 40) * 100));
+    mark.style.left = pct + '%';
+    mark.style.display = 'block';
+  } else mark.style.display = 'none';
+}
+
+function drawChart() {
+  const cv = $('tempChart');
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const minT = 15, maxT = 50, pad = 8;
+  const y = (t) => h - pad - (Math.min(maxT, Math.max(minT, t)) - minT) / (maxT - minT) * (h - 2 * pad);
+
+  // Grilla
+  ctx.strokeStyle = '#16212c'; ctx.lineWidth = 1;
+  [20, 30, 40].forEach((t) => { ctx.beginPath(); ctx.moveTo(0, y(t)); ctx.lineTo(w, y(t)); ctx.stroke(); });
+  ctx.fillStyle = '#4a5866'; ctx.font = '10px Consolas, monospace';
+  [20, 30].forEach((t) => ctx.fillText(t + '°', 4, y(t) - 3));
+
+  // Umbral de alarma
+  ctx.strokeStyle = 'rgba(255,59,59,0.7)'; ctx.setLineDash([5, 4]);
+  ctx.beginPath(); ctx.moveTo(0, y(TEMP_UMBRAL)); ctx.lineTo(w, y(TEMP_UMBRAL)); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = 'rgba(255,59,59,0.85)'; ctx.fillText('40° alarma', 4, y(TEMP_UMBRAL) - 3);
+
+  const d = state.tempHist;
+  if (d.length < 2) return;
+  const x = (i) => (i / (HIST_POINTS - 1)) * w;
+
+  // Relleno con degradé
+  const g = ctx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, 'rgba(255,181,71,0.28)'); g.addColorStop(1, 'rgba(255,181,71,0)');
+  ctx.beginPath(); ctx.moveTo(x(0), h);
+  d.forEach((t, i) => ctx.lineTo(x(i), y(t)));
+  ctx.lineTo(x(d.length - 1), h); ctx.closePath(); ctx.fillStyle = g; ctx.fill();
+
+  // Línea
+  ctx.beginPath();
+  d.forEach((t, i) => (i ? ctx.lineTo(x(i), y(t)) : ctx.moveTo(x(i), y(t))));
+  ctx.strokeStyle = '#ffb547'; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.stroke();
+  const last = d[d.length - 1];
+  ctx.fillStyle = last > TEMP_UMBRAL ? '#ff3b3b' : '#ffb547';
+  ctx.beginPath(); ctx.arc(x(d.length - 1), y(last), 3.5, 0, Math.PI * 2); ctx.fill();
+}
+
+function renderHistory() {
+  const body = $('histBody');
+  body.innerHTML = '';
+  state.results.forEach((r) => {
+    const c = bpmClass(r.bpm);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${r.hora}</td><td class="bpm">${r.bpm || '---'}</td><td>${r.temp} °C</td>` +
+                   `<td><span class="chip ${c.cls}">${c.txt}</span></td>`;
+    body.appendChild(tr);
+  });
+  $('histEmpty').style.display = state.results.length ? 'none' : 'block';
+  $('btnCsv').disabled = !state.results.length;
+}
+
+/* ---------- Réplica del display de 7 segmentos ---------- */
+// Segmentos a..g + símbolos usados por el firmware (°, C, F, t, -)
+const SEG_SHAPES = {
+  a: '8,2 38,2 33,8 13,8', b: '39,3 39,37 34,34 34,9', c: '39,43 39,77 34,71 34,46',
+  d: '8,78 38,78 33,72 13,72', e: '7,43 12,46 12,71 7,77', f: '7,3 12,9 12,34 7,37',
+  g: '9,40 13,36 33,36 37,40 33,44 13,44'
+};
+const GLYPHS = {
+  '0': 'abcdef', '1': 'bc', '2': 'abdeg', '3': 'abcdg', '4': 'bcfg', '5': 'acdfg', '6': 'acdefg',
+  '7': 'abc', '8': 'abcdefg', '9': 'abcdfg', '°': 'abfg', 'C': 'adef', 'F': 'aefg', 't': 'defg', '-': 'g', ' ': ''
+};
+function buildDigits() {
+  const box = $('segBox');
+  for (let i = 0; i < 4; i++) {
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', '0 0 46 80'); svg.classList.add('digit');
+    Object.entries(SEG_SHAPES).forEach(([k, pts]) => {
+      const p = document.createElementNS(ns, 'polygon');
+      p.setAttribute('points', pts); p.dataset.seg = k; svg.appendChild(p);
+    });
+    box.appendChild(svg);
+  }
+}
+function setDigits(text) {
+  const digits = $('segBox').querySelectorAll('svg');
+  [...text.padEnd(4).slice(0, 4)].forEach((ch, i) => {
+    const on = GLYPHS[ch] || '';
+    digits[i].querySelectorAll('polygon').forEach((p) => p.classList.toggle('on', on.includes(p.dataset.seg)));
+  });
+}
+function renderDisplay() {
+  // Mismo formato que ACTUALIZAR_DISPLAY del firmware
+  let txt;
+  if (!state.link || state.temp === null) txt = '    ';
+  else if (state.dispMode === 'temp') txt = String(Math.min(state.temp, 99)).padStart(2, '0') + '°C';
+  else if (state.measSec > 0) txt = 't-' + String(state.measSec).padStart(2, '0');
+  else txt = state.bpm > 0 ? 'F' + String(state.bpm).padStart(3, '0') : 'F---';
+  setDigits(txt);
+  $('dispChip').textContent = state.dispMode === 'temp' ? 'Temperatura' : 'Frecuencia';
+}
+
+/* =====================================================================
+   Conexión, botones y teclado
+   ===================================================================== */
+function setLink(link) {
+  state.link = link;
+  const pill = $('connPill');
+  pill.className = 'pill' + (link === 'serial' ? ' on' : link === 'demo' ? ' demo' : '');
+  $('connText').textContent = link === 'serial' ? 'Conectado · 9600 bps' : link === 'demo' ? 'Modo demo' : 'Desconectado';
+  $('btnConnect').textContent = link === 'serial' ? 'Desconectar' : 'Conectar PIC';
+  $('btnConnect').disabled = link === 'demo';
+  $('btnDemo').textContent = link === 'demo' ? 'Salir de demo' : 'Modo demo';
+  $('btnDemo').disabled = link === 'serial';
+  $('btnMeasure').disabled = !link || state.measSec > 0;
+  $('btnToggle').disabled = !link;
+  if (link) { state.dispMode = 'temp'; }   // el firmware arranca mostrando temperatura
+  renderDisplay();
+}
+
+$('btnConnect').addEventListener('click', () => (state.link === 'serial' ? disconnectSerial() : connectSerial()));
+$('btnDemo').addEventListener('click', () => (state.link === 'demo' ? demo.stop() : demo.start()));
+$('btnMeasure').addEventListener('click', () => sendCmd('I'));
+$('btnToggle').addEventListener('click', () => sendCmd('V'));
+$('btnCsv').addEventListener('click', exportCsv);
+
+document.addEventListener('keydown', (e) => {
+  if (!state.link || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toUpperCase();
+  if (k === 'I' && state.measSec === 0) sendCmd('I');
+  if (k === 'V') sendCmd('V');
+});
+
+function exportCsv() {
+  const rows = [['fecha', 'hora', 'bpm', 'temperatura_c']]
+    .concat(state.results.slice().reverse().map((r) => [r.fecha, r.hora, r.bpm, r.temp]));
+  const blob = new Blob([rows.map((r) => r.join(';')).join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'G7_mediciones.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ---------- Consola ---------- */
+function logLine(text, cls) {
+  const log = $('log');
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = new Date().toLocaleTimeString('es-AR') + '  ' + text;
+  log.appendChild(line);
+  while (log.childNodes.length > 300) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
+}
+function alertBox(msg) { window.alert(msg); }
+
+/* =====================================================================
+   Modo demo: genera las mismas tramas que el PIC
+   ===================================================================== */
+const demo = {
+  timer: null, temp: 36.4, sec: 0, sub: 0, bpm: 0, heating: 0,
+  start() {
+    this.temp = 36.4; this.sec = 0; this.bpm = 0; this.heating = 0;
+    setLink('demo');
+    logLine('Modo demo: tramas simuladas cada 250 ms. Tecla H: simular calentamiento.');
+    this.timer = setInterval(() => this.tick(), 250);
+  },
+  stop() { clearInterval(this.timer); this.timer = null; setLink(null); logLine('Fin del modo demo.'); },
+  command(ch) {
+    if (ch === 'I') { this.sec = MEAS_SECONDS; this.sub = 0; }
+  },
+  tick() {
+    // Temperatura: deriva suave alrededor de 36 °C, o sube si se "calienta" con la tecla H
+    if (this.heating > 0) { this.temp += 0.35; this.heating--; }
+    else this.temp += (36.4 - this.temp) * 0.02 + (Math.random() - 0.5) * 0.15;
+    if (this.sec > 0 && ++this.sub === 4) {
+      this.sub = 0;
+      if (--this.sec === 0) this.bpm = 4 * (15 + Math.floor(Math.random() * 7)); // 60..84 BPM
+    }
+    const p = (n, l) => String(Math.round(n)).padStart(l, '0');
+    handleFrame(`T${p(this.temp, 2)},M${p(this.sec, 2)},B${p(this.bpm, 3)}`);
+  }
+};
+document.addEventListener('keydown', (e) => {
+  if (state.link === 'demo' && e.key.toUpperCase() === 'H') demo.heating = 24;
+});
+
+/* ---------- Inicio ---------- */
+buildDigits();
+renderTemp();
+renderPulse();
+renderHistory();
+setLink(null);
+window.addEventListener('resize', drawChart);
+</script>
+</body>
+</html>

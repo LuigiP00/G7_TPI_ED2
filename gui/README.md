@@ -1,12 +1,20 @@
 # GUI del pulsómetro
 
-Interfaz gráfica para la PC, en **Python 3** con **pySerial** y **Tkinter**.
+Interfaz web (`index.html`) que se comunica con el PIC por el puerto serie usando la **Web Serial API** del navegador. No necesita instalar nada.
 
-Funciones previstas:
+## Cómo usarla
 
-- Elegir el puerto COM y conectarse a 9600 bps.
-- Mostrar la temperatura, el estado de la medición, el resultado en BPM y la alarma térmica.
-- Enviar las teclas `1`, `2`, `A` y `D` (también desde el teclado de la PC).
-- Graficar en vivo la señal del sensor en modo depuración, para ajustar los umbrales.
+1. Conectar el adaptador USB–UART (CP2102) a la PC.
+2. Abrir `index.html` con **Google Chrome** o **Microsoft Edge** (Firefox no soporta Web Serial).
+3. Tocar **Conectar PIC** y elegir el puerto COM del CP2102.
+4. Comandos:
+   - **Iniciar Medición de Pulso** o tecla **I**: mide el pulso durante 15 s.
+   - **Alternar Display Físico** o tecla **V**: cambia lo que muestra el display entre temperatura y frecuencia cardíaca.
+
+## Qué muestra
+
+- Temperatura en °C con gráfico de las últimas lecturas y una línea de referencia en 40 °C. Por encima de 40 °C la tarjeta se pone en rojo (alarma).
+- Frecuencia cardíaca en BPM, con cuenta regresiva y barra de progreso durante la medición.
+- La última trama recibida, para depurar.
 
 Protocolo: ver [`../docs/protocolo_serie.md`](../docs/protocolo_serie.md).
