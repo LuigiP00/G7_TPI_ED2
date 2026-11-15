@@ -2,34 +2,39 @@
 
 Configuración: **9600 bps, 8 bits, sin paridad, 1 bit de stop (8N1)**.
 
-Todas las tramas del PIC son texto y terminan en `\r\n`. Los valores numéricos van siempre con tres cifras.
+Corresponde al firmware `firmware/G7_TPI_ED2.asm` (v4.0) y a la GUI `gui/index.html`.
 
 ## PIC → PC
 
-| Trama | Cuándo | Significado |
+El PIC envía una sola trama de texto cada ~250 ms, terminada en `\r\n`:
+
+```
+Txx,Myy,Bzzz
+```
+
+| Campo | Significado | Ejemplo |
 | --- | --- | --- |
-| `T=025` | Cada 500 ms | Temperatura del LM35 (cuentas del ADC ≈ °C) |
-| `S=0` | Al encender | En espera |
-| `S=1,15` | Al iniciar y cada segundo de la medición | Midiendo; segundos que faltan |
-| `S=2` | Al terminar la medición | Resultado listo |
-| `B=072` | Al terminar la medición | Frecuencia cardíaca en BPM (`B=000` si no hubo latidos) |
-| `A=1` / `A=0` | Al cambiar | Alarma térmica activada / desactivada |
-| `P=128` | 50 veces por segundo, solo en modo depuración | Muestra cruda del sensor de pulso (cuentas del ADC) |
+| `Txx` | Temperatura del LM35 en °C (2 cifras, satura en 99) | `T27` |
+| `Myy` | Segundos que faltan de la medición de pulso; `00` si no hay medición en curso | `M12` |
+| `Bzzz` | Última frecuencia cardíaca medida en BPM (3 cifras); `000` si todavía no hay resultado o no se detectaron latidos | `B072` |
+
+Ejemplos:
+
+- `T26,M00,B000`: en reposo, 26 °C, sin medición previa.
+- `T27,M09,B000`: midiendo, faltan 9 s.
+- `T27,M00,B064`: medición terminada, 64 BPM.
 
 ## PC → PIC
 
-Un carácter por tecla:
+Un carácter por comando (se aceptan mayúsculas y minúsculas):
 
 | Carácter | Acción |
 | --- | --- |
-| `1` | Mostrar la temperatura en el display |
-| `2` | Mostrar la frecuencia cardíaca en el display |
-| `A` | Iniciar una medición de pulso de 15 s |
-| `D` | Activar o desactivar el modo depuración (tramas `P=`) |
+| `I` | Inicia una medición de pulso de 15 s. El display pasa a la cuenta regresiva `t-15` … `t-01` y al final muestra `FXXX` (o `F---` si no hubo latidos). |
+| `V` | Alterna el display entre temperatura (`XX°C`) y frecuencia cardíaca (`FXXX`). |
 
 ## Conversión de cuentas
 
-Con Vref+ = 2,50 V y 8 bits, cada cuenta del ADC vale 9,77 mV.
+Con Vref+ = 2,50 V y 8 bits, cada cuenta del ADC vale 9,77 mV. El firmware convierte la lectura del LM35 a °C enteros como `°C = cuentas × 250 / 256`.
 
-- Temperatura: °C ≈ cuentas × 0,977.
-- Señal de pulso en el pin: V = cuentas × 0,00977 (antes del divisor, el doble).
+La frecuencia cardíaca se calcula como `latidos en 15 s × 4`, por lo que la resolución es de 4 BPM.
