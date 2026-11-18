@@ -1,5 +1,5 @@
 ;*******************************************************************************
-; @brief       ANEXO B - FIRMWARE DEL SEP.
+; @brief       ANEXO B - FIRMWARE DEL SEP (ARQUITECTURA POR INTERRUPCIONES).
 ;
 ; @brief       Termómetro digital (LM35) + Pulsómetro a demanda por UART
 ;              (HW-827 @ 5V, divisor simétrico 22k/22k + 1 uF, filtro FIR de
@@ -7,26 +7,24 @@
 ;              con display multiplexado de 4 dígitos, alarma lumínica/sonora y
 ;              telemetría ASCII por EUSART hacia interfaz web local.
 ;
-; @details     - AN0 (RA0): Sensor de temperatura LM35 (10 mV/°C, Vref+ = 2.50 V).
+; @details     - Arquitectura 100 % dirigida por eventos (ISR multi-fuente):
+;                  * Timer1 (5 ms)    -> ATENDER_MULTIPLEX_DISPLAY
+;                  * EUSART RX        -> ATENDER_RECEPCION_UART ('I' / 'V' / 'G')
+;                  * EUSART TX        -> ATENDER_TRANSMISION_UART
+;                  * Timer0 (9.98 ms) -> ADQUISICION_SENALES_ADC (ADC, control y TX)
+;              - AN0 (RA0): Sensor de temperatura LM35 (10 mV/°C, Vref+ = 2.50 V).
 ;              - AN1 (RA1): Sensor de pulsos HW-827 (5 V) con divisor simétrico
 ;                           22k/22k y capacitor electrolítico de 1 uF a masa.
-;              - EUSART (RC6/TX, RC7/RX @ 9600 Bd):
-;                  * RX 'I'/'i': Inicia adquisición de pulsos (15 s) usando
-;                                los umbrales pre-calibrados, cambia a vista
-;                                Frecuencia y muestra cuenta regresiva
-;                                t-15 .. t-01; al finalizar muestra FXXX o
-;                                F--- si no detectó pulsos.
-;                  * RX 'V'/'v': Alterna display entre Temperatura (XX°C) y
-;                                Frecuencia cardíaca (FXXX / F---).
-;                  * TX cada 250 ms: Envía trama "Txx,Myy,Bzzz\r\n" a la PC.
 ;              - Alarmas de temperatura (> 40 °C): LED rojo RB7 ON, LED verde
-;                RB6 OFF y buzzer RC4 con ciclos de 0.25 s ON / 3.0 s OFF.
+;                RB6 OFF y buzzer RC4 encendido de forma continua.
+;              - Comando 'G'/'g': Alterna volcado CSV "XXX,L\r\n" a 100 Hz con el
+;                valor ADC de AN1 y el disparo de pulso para graficación.
 ; 
 ; @author      Gx_TPI_ED2
 ;
-; @date        15/11/2026
+; @date        17/11/2026
 ;
-; @version     4.0
+; @version     6.4
 ;*******************************************************************************
 	    
 ;===============================================================================
@@ -46,88 +44,88 @@
 ; DEFINICIÓN DE CONSTANTES
 ;===============================================================================                
 ; --- Temporizadores ---
-TMR0_PRELOAD    EQU d'100'      ; 156 cuentas x 64 us = 9.984 ms por tick
-TMR1_PRELOAD_H  EQU 0xEC        ; 0xEC78 = 60536 -> 5000 us = 5 ms por dígito
-TMR1_PRELOAD_L  EQU 0x78
+PRECARGA_TMR0           EQU d'100'      ; 156 cuentas x 64 us = 9.984 ms por tick
+PRECARGA_TMR1_H         EQU 0xEC        ; 0xEC78 = 60536 -> 5000 us = 5 ms por dígito
+PRECARGA_TMR1_L         EQU 0x78
 
-; --- Temperatura y Buzzer ---
-TEMP_UMBRAL     EQU d'40'       ; Umbral de alarma en °C
-DISP_REF_TICKS  EQU d'25'       ; Refresco display y TX: 25 x 9.984 ms = ~250 ms
-BUZZ_SUB_TICKS  EQU d'25'       ; Subintervalo base del buzzer: 0.25 s
-BUZZ_TOTAL_STEP EQU d'13'       ; 1 paso ON (0.25 s) + 12 pasos OFF (3.0 s)
+; --- Temperatura y Refresco ---
+UMBRAL_TEMP_ALARMA      EQU d'40'       ; Umbral de alarma térmica en °C (> 40 °C)
+TICKS_REFRESCO_DISP     EQU d'25'       ; Refresco display y TX: 25 x 9.984 ms = ~250 ms
 
 ; --- Pulsómetro (FIR 4 muestras + Pre-calibración adaptativa 140 ms) ---
-MEAS_SECONDS    EQU d'15'       ; Duración de la ventana de adquisición (15 s)
-TICKS_PER_SEC   EQU d'100'      ; 100 x 9.984 ms = ~1.00 s por paso regresivo
-REFRACT_TICKS   EQU d'45'       ; Bloqueo refractario: 45 x 9.984 ms = ~450 ms
-DECAY_TICKS     EQU d'150'      ; Decaimiento de MAX_DROP: 150 ticks = ~1.50 s
-DROP_THRESH_IDLE EQU d'5'       ; Umbral sin pulso confirmado (rechaza ruido)
-DROP_THRESH_MIN EQU d'4'        ; Piso mínimo con pulso débil confirmado
-DROP_THRESH_MAX EQU d'9'        ; Techo máximo del umbral adaptativo
-DROP_CAP_MAX    EQU d'18'       ; Tope de almacenamiento para decaimiento ágil
-DROP_TRANS_LIM  EQU d'28'       ; Límite superior para descartar transitorios
+SEGUNDOS_MEDICION       EQU d'15'       ; Duración de la ventana de medición (15 s)
+TICKS_POR_SEGUNDO       EQU d'100'      ; 100 x 9.984 ms = ~1.00 s por paso regresivo
+TICKS_BLOQUEO_LATIDO    EQU d'45'       ; Bloqueo refractario: 45 x 9.984 ms = ~450 ms
+TICKS_DECAIMIENTO       EQU d'150'      ; Decaimiento de caída máx: 150 ticks = ~1.50 s
+UMBRAL_CAIDA_REPOSO     EQU d'5'        ; Umbral sin pulso confirmado (rechaza ruido)
+UMBRAL_CAIDA_MIN        EQU d'4'        ; Piso mínimo con pulso débil confirmado
+UMBRAL_CAIDA_MAX        EQU d'9'        ; Techo máximo del umbral adaptativo
+TOPE_CAIDA_MAX          EQU d'18'       ; Tope de almacenamiento para decaimiento ágil
+LIMITE_RUIDO_TRANS      EQU d'28'       ; Límite superior para descartar transitorios
 
 ; --- Canales ADC (Fosc/8, ADON=1) ---
-ADC_CH_AN0      EQU b'01000001' ; Canal AN0 (LM35)
-ADC_CH_AN1      EQU b'01000101' ; Canal AN1 (HW-827)
+CANAL_ADC_TEMP          EQU b'01000001' ; Canal AN0 (LM35)
+CANAL_ADC_PULSO         EQU b'01000101' ; Canal AN1 (HW-827)
 
 ; --- EUSART ---
-SPBRG_9600      EQU d'25'       ; 4 MHz / (16 * (25 + 1)) = 9615 Bd (Error 0.16%)
-TX_FRAME_LEN    EQU d'14'       ; Longitud de trama "Txx,Myy,Bzzz\r\n"
+BAUDIOS_9600            EQU d'25'       ; 4 MHz / (16 * (25 + 1)) = 9615 Bd (Error 0.16%)
+LARGO_TRAMA_TX          EQU d'14'       ; Longitud de trama "Txx,Myy,Bzzz\r\n"
+LARGO_TRAMA_GRAFICO     EQU d'7'        ; Longitud de trama CSV "XXX,L\r\n" (7.28 ms)
 
 ; --- Display 7 Segmentos (Ánodo común, lógica negativa) ---
-SEG_T           EQU 0x87        ; Letra 't'   (d, e, f, g en 0)
-SEG_F           EQU 0x8E        ; Letra 'F'   (a, e, f, g en 0)
-SEG_DEG         EQU 0x9C        ; Símbolo '°' (a, b, f, g en 0)
-SEG_DASH        EQU 0xBF        ; Guion '-'   (g en 0)
-SEG_C           EQU 0xC6        ; Letra 'C'   (a, d, e, f en 0)
-SEG_OFF         EQU 0xFF        ; Todos los segmentos apagados
+CARACTER_T              EQU 0x87        ; Letra 't'   (d, e, f, g en 0)
+CARACTER_F              EQU 0x8E        ; Letra 'F'   (a, e, f, g en 0)
+CARACTER_GRADO          EQU 0x9C        ; Símbolo '°' (a, b, f, g en 0)
+CARACTER_GUION          EQU 0xBF        ; Guion '-'   (g en 0)
+CARACTER_C              EQU 0xC6        ; Letra 'C'   (a, d, e, f en 0)
+DISPLAY_APAGADO         EQU 0xFF        ; Todos los segmentos apagados
 
-; --- Bits de FLAGS ---
-F_DISP_MODE     EQU 0           ; 0 = Muestra Temperatura, 1 = Muestra Frecuencia
-F_MEAS_ACTIVE   EQU 1           ; 1 = Medición de pulsos (15 s) en curso
-F_CMD_START     EQU 2           ; 1 = Comando 'I' recibido por UART
-F_PULSE_LOCK    EQU 3           ; 1 = Latido detectado (esperar DROP <= 1)
+; --- Bits del registro BANDERAS ---
+BIT_MODO_DISPLAY        EQU 0           ; 0 = Muestra Temperatura, 1 = Muestra Frecuencia
+BIT_MIDIENDO_PULSO      EQU 1           ; 1 = Medición de pulsos (15 s) en curso
+BIT_LATIDO_DETECTADO    EQU 2           ; 1 = Latido detectado (esperar caída <= 1)
+BIT_MODO_GRAFICO        EQU 3           ; 1 = Volcado CSV ADC de pulso a 100 Hz por UART
 
 ;===============================================================================
-; DEFINICIÓN DE VARIABLES
+; DEFINICIÓN DE VARIABLES EN RAM
 ;=============================================================================== 
-    CBLOCK 0x20                 ; Banco 0
-        FLAGS                   ; Banderas de estado del sistema
-        RX_TEMP                 ; Buffer temporal de carácter recibido por UART
-        ; --- Temperatura y Buzzer ---
-        TEMP_C                  ; Temperatura entera en °C
-        PROD_L, PROD_H          ; Auxiliar de 16 bits para escalado ADC -> °C
-        AUX_L, AUX_H            ; Auxiliar de cálculo y retardo de adquisición
-        DISP_TMR                ; Temporizador de refresco visual (~250 ms)
-        BUZZ_STEP               ; Pasos de 0.25 s del buzzer (13 = ON, 12..1 = OFF)
-        BUZZ_SUB                ; Subcontador de 25 ticks (0.25 s)
-        ; --- Pulsómetro (FIR 4-tap + Pre-calibración adaptativa) ---
-        PULSE_ADC               ; Última muestra ADC de AN1 (0..255)
-        S4_NOW_L, S4_NOW_H      ; Suma de las 4 muestras actuales (0..1020)
-        S4_OLD_L, S4_OLD_H      ; Suma de hace 140 ms y diferencia DROP
-        DROP_THRESH             ; Umbral dinámico de caída sistólica (4..9)
-        MAX_DROP                ; Máxima caída sistólica reciente (con decaimiento)
-        DECAY_TMR               ; Temporizador de decaimiento de MAX_DROP (1.5 s)
-        REFRACT                 ; Ticks restantes de bloqueo refractario
-        COUNTDOWN_SEC           ; Segundos restantes de medición (15..1)
-        SEC_SUB_TMR             ; Subcontador de 100 ticks (~1 s)
-        PULSE_COUNT             ; Latidos contados en la ventana de 15 s
-        BPM_VAL                 ; Frecuencia cardíaca calculada (latidos x 4)
-        PULSE_BUF:18            ; Historial circular de 18 muestras (180 ms)
-        ; --- Display ---
-        DSPL_1, DSPL_2          ; Segmentos dígito 1 (izq) y dígito 2
-        DSPL_3, DSPL_4          ; Segmentos dígito 3 y dígito 4 (der)
-        MUX_IDX, MUX_MASK       ; Índice y máscara de multiplexado (RC0..RC3)
-        HUNDREDS, TENS, UNITS   ; Dígitos decimales para formateo
-        ; --- Telemetría UART TX ---
-        TX_LEN                  ; Bytes pendientes de envío (0 = libre)
-        TX_IDX                  ; Índice actual dentro de TX_BUF
-        TX_BUF:14               ; Trama ASCII "Txx,Myy,Bzzz\r\n"
+    CBLOCK 0x20                         ; Banco 0
+        BANDERAS                        ; Banderas de estado del sistema
+        DATO_RX_UART                    ; Carácter recibido por puerto serie
+        ; --- Temperatura y Cálculos Generales ---
+        TEMP_ACTUAL_C                   ; Temperatura medida en °C enteros
+        ACUM_16_L, ACUM_16_H            ; Acumulador de 16 bits (escalado temp y suma FIR)
+        AUX_CALC_L, AUX_CALC_H          ; Registros auxiliares de cálculo y retardos
+        CONT_REFRESCO_DISP              ; Contador de ticks para refresco visual (~250 ms)
+        ; --- Pulsómetro (Filtro FIR 4 muestras + Umbral Adaptativo) ---
+        MUESTRA_ADC_PULSO               ; Última conversión ADC de AN1 (0..255)
+        SUMA_FIR_ACTUAL_L               ; Suma de las 4 muestras más recientes (byte bajo)
+        SUMA_FIR_ACTUAL_H               ; Suma de las 4 muestras más recientes (byte alto)
+        SUMA_FIR_ANTERIOR_L             ; Suma de hace 140 ms y luego caída sistólica (L)
+        SUMA_FIR_ANTERIOR_H             ; Suma de hace 140 ms y luego caída sistólica (H)
+        UMBRAL_CAIDA_ACTUAL             ; Umbral dinámico de detección de latido (4..9)
+        CAIDA_MAX_RECIENTE              ; Máxima caída sistólica reciente (con decaimiento)
+        CONT_DECAIMIENTO                ; Temporizador de decaimiento (1.5 s)
+        CONT_BLOQUEO_LATIDO             ; Ticks restantes de bloqueo refractario
+        SEGUNDOS_RESTANTES              ; Cuenta regresiva de medición (15..1 s)
+        CONT_TICKS_SEGUNDO              ; Subcontador de 100 ticks (~1 s)
+        CONTADOR_LATIDOS                ; Latidos detectados en la ventana de 15 s
+        FRECUENCIA_BPM                  ; Frecuencia cardíaca calculada (latidos x 4)
+        BUFFER_MUESTRAS_PULSO:18        ; Historial circular de 18 muestras (180 ms)
+        ; --- Display 7 Segmentos ---
+        DIGITO_1, DIGITO_2              ; Patrón de segmentos dígito 1 (izq) y dígito 2
+        DIGITO_3, DIGITO_4              ; Patrón de segmentos dígito 3 y dígito 4 (der)
+        INDICE_MULTIPLEX                ; Dígito activo actual en el barrido (0..3)
+        MASCARA_DIGITO                  ; Máscara de habilitación en RC0..RC3
+        CENTENAS, DECENAS, UNIDADES     ; Dígitos decimales para conversión BCD
+        ; --- Telemetría Serie UART TX ---
+        BYTES_PENDIENTES_TX             ; Cantidad de bytes por enviar (0 = libre)
+        INDICE_TX                       ; Posición actual dentro de BUFFER_TRAMA_TX
+        BUFFER_TRAMA_TX:14              ; Trama ASCII "Txx,Myy,Bzzz\r\n" o CSV "XXX,L\r\n"
     ENDC
 
-    CBLOCK 0x70                 ; Memoria común (guardado de contexto ISR)
-        W_TEMP, STATUS_TEMP, FSR_TEMP
+    CBLOCK 0x70                         ; Memoria común (guardado de contexto ISR)
+        W_TEMP, STATUS_TEMP, FSR_TEMP, PCLATH_TEMP
     ENDC
 
 ;===============================================================================
@@ -135,98 +133,117 @@ F_PULSE_LOCK    EQU 3           ; 1 = Latido detectado (esperar DROP <= 1)
 ;===============================================================================            
 CFG_PORTA MACRO
     BANKSEL ANSEL
-    MOVLW   b'00001011'         ; RA0 (AN0, LM35), RA1 (AN1, pulso) y RA3 (Vref+) analógicos
+    MOVLW   b'00001011'                 ; RA0 (AN0, LM35), RA1 (AN1, pulso) y RA3 (Vref+) analógicos
     MOVWF   ANSEL
     BANKSEL TRISA
-    MOVLW   b'00001011'         ; RA0, RA1 y RA3 como entradas
+    MOVLW   b'00001011'                 ; RA0, RA1 y RA3 como entradas
     MOVWF   TRISA
     ENDM
 
 CFG_PORTB MACRO
     BANKSEL ANSELH
-    CLRF    ANSELH              ; PORTB completamente digital
+    CLRF    ANSELH                      ; PORTB completamente digital
     BANKSEL TRISB
-    MOVLW   b'00111111'         ; RB6 (LED verde) y RB7 (LED rojo) como salidas
+    MOVLW   b'00111111'                 ; RB6 (LED verde) y RB7 (LED rojo) como salidas
     MOVWF   TRISB
     BANKSEL PORTB
-    CLRF    PORTB               ; LEDs inicialmente apagados
+    CLRF    PORTB                       ; LEDs inicialmente apagados
     ENDM
 
 CFG_PORTC MACRO
     BANKSEL TRISC
-    MOVLW   b'11100000'         ; RC0..RC3 (dígitos), RC4 (buzzer) salidas; RC6/RC7 UART
+    MOVLW   b'11100000'                 ; RC0..RC3 (dígitos), RC4 (buzzer) salidas; RC6/RC7 UART
     MOVWF   TRISC
     BANKSEL PORTC
-    MOVLW   b'11101111'         ; Dígitos apagados (1) y buzzer RC4 apagado (0)
+    MOVLW   b'11101111'                 ; Dígitos apagados (1) y buzzer RC4 apagado (0)
     MOVWF   PORTC
     ENDM
 
 CFG_PORTD MACRO
     BANKSEL TRISD
-    CLRF    TRISD               ; RD0..RD7 (segmentos) como salidas
+    CLRF    TRISD                       ; RD0..RD7 (segmentos) como salidas
     BANKSEL PORTD
-    MOVLW   SEG_OFF             ; Segmentos apagados (ánodo común, lógica negativa)
+    MOVLW   DISPLAY_APAGADO             ; Segmentos apagados (ánodo común, lógica negativa)
     MOVWF   PORTD
     ENDM
 
 CFG_ADC MACRO
     BANKSEL ADCON1
-    MOVLW   b'00010000'         ; ADFM=0 (8 bits en ADRESH), VCFG0=1 (Vref+ en RA3)
+    MOVLW   b'00010000'                 ; ADFM=0 (8 bits en ADRESH), VCFG0=1 (Vref+ en RA3)
     MOVWF   ADCON1
     BANKSEL ADCON0
-    MOVLW   ADC_CH_AN0          ; Fosc/8, canal AN0, ADC encendido
+    MOVLW   CANAL_ADC_TEMP              ; Fosc/8, canal AN0, ADC encendido
     MOVWF   ADCON0
-    ENDM
-
-CFG_TIMER0 MACRO
-    BANKSEL OPTION_REG
-    MOVLW   b'11010101'         ; Pull-ups deshabilitados, Timer0 prescaler 1:64
-    MOVWF   OPTION_REG
-    BANKSEL TMR0
-    MOVLW   TMR0_PRELOAD        ; Precarga para base de tiempo de 9.984 ms
-    MOVWF   TMR0
-    BCF     INTCON, T0IF
     ENDM
 
 CFG_EUSART MACRO
     BANKSEL BAUDCTL
-    BCF     BAUDCTL, BRG16      ; Generador de baudios de 8 bits
+    BCF     BAUDCTL, BRG16              ; Generador de baudios de 8 bits
     BANKSEL SPBRG
-    MOVLW   SPBRG_9600          ; 9600 Bd @ 4 MHz (BRGH=1, SYNC=0)
+    MOVLW   BAUDIOS_9600                ; 9600 Bd @ 4 MHz (BRGH=1, SYNC=0)
     MOVWF   SPBRG
-    MOVLW   b'00100100'         ; TXEN=1 (habilita TX), SYNC=0 (asíncrono), BRGH=1
+    MOVLW   b'00100100'                 ; TXEN=1 (habilita TX), SYNC=0 (asíncrono), BRGH=1
     MOVWF   TXSTA
     BANKSEL PIE1
-    BSF     PIE1, RCIE          ; Habilita interrupción por recepción RX
+    BSF     PIE1, RCIE                  ; Habilita interrupción por recepción RX
+    BCF     PIE1, TXIE                  ; TXIE se habilita bajo demanda al armar trama
     BANKSEL RCSTA
-    MOVLW   b'10010000'         ; SPEN=1 (habilita RC6/RC7), CREN=1 (RX continua)
+    MOVLW   b'10010000'                 ; SPEN=1 (habilita RC6/RC7), CREN=1 (RX continua)
     MOVWF   RCSTA
+    ENDM
+
+CFG_TIMER0 MACRO
+    BANKSEL OPTION_REG
+    MOVLW   b'11010101'                 ; Pull-ups deshabilitados, Timer0 prescaler 1:64
+    MOVWF   OPTION_REG
+    BANKSEL TMR0
+    MOVLW   PRECARGA_TMR0               ; Precarga para base de tiempo de 9.984 ms
+    MOVWF   TMR0
+    BCF     INTCON, T0IF
+    BSF     INTCON, T0IE                ; Habilita interrupción por desborde de Timer0
     ENDM
 
 CFG_TIMER1 MACRO
     BANKSEL T1CON
-    MOVLW   b'00000001'         ; TMR1ON=1, reloj interno, prescaler 1:1
+    MOVLW   b'00000001'                 ; TMR1ON=1, reloj interno, prescaler 1:1
     MOVWF   T1CON
-    MOVLW   TMR1_PRELOAD_H      ; Precarga para interrupción cada 5 ms
+    MOVLW   PRECARGA_TMR1_H             ; Precarga para interrupción cada 5 ms
     MOVWF   TMR1H
-    MOVLW   TMR1_PRELOAD_L
+    MOVLW   PRECARGA_TMR1_L
     MOVWF   TMR1L
     BCF     PIR1, TMR1IF
     BANKSEL PIE1
-    BSF     PIE1, TMR1IE        ; Habilita interrupción de Timer1
-    BANKSEL PORTB               ; Selecciona Banco 0 de forma permanente
-    BSF     INTCON, PEIE        ; Habilita interrupciones de periféricos
-    BSF     INTCON, GIE         ; Habilita interrupciones globales
+    BSF     PIE1, TMR1IE                ; Habilita interrupción de Timer1
+    BANKSEL PORTB                       ; Selecciona Banco 0 de forma permanente
     ENDM
 
 ;===============================================================================
 ; INICIALIZACIÓN DEL MCU (CÓDIGO ABSOLUTO)
 ;===============================================================================    
-    ORG     0x00                ; Vector de Reset
-    GOTO    INICIO              ; Salto al inicio del programa principal
-    ORG     0x04                ; Vector de Interrupción
-    GOTO    ISR_INICIO          ; Salto a la Rutina de Servicio de Interrupción
-    ORG     0x05                ; Ubicación Programa Principal en la memoria 
+    ORG     0x00                        ; Vector de Reset
+    GOTO    INICIO                      ; Salto al inicio del programa principal
+    ORG     0x04                        ; Vector de Interrupción
+    GOTO    ISR_INICIO                  ; Salto a la Rutina de Servicio de Interrupción
+    ORG     0x05                        ; Inicio Página 0 - Tabla de conversión 7 segmentos
+
+;*******************************************************************************
+; @brief    Tabla de conversión BCD a 7 segmentos (ánodo común).
+;           
+; @details  Ubicada al inicio de Página 0 (0x05..0x0F) para evitar cruces de
+;           frontera de 256 words en el salto calculado ADDWF PCL, F.
+;*******************************************************************************
+TABLA_7SEG:
+    ADDWF   PCL, F
+    RETLW   0xC0                        ; 0
+    RETLW   0xF9                        ; 1
+    RETLW   0xA4                        ; 2
+    RETLW   0xB0                        ; 3
+    RETLW   0x99                        ; 4
+    RETLW   0x92                        ; 5
+    RETLW   0x82                        ; 6
+    RETLW   0xF8                        ; 7
+    RETLW   0x80                        ; 8
+    RETLW   0x90                        ; 9
 
 ;===============================================================================
 ; INICIALIZACIÓN DE MACROS PARA CONFIGURACIÓN DE REGISTROS
@@ -238,61 +255,36 @@ INICIO
     CFG_PORTC
     CFG_PORTD
     CFG_ADC
-    CFG_TIMER0
     CFG_EUSART
 
     ;-----Inicialización de Variables----
     BANKSEL PORTB
-    CLRF    FLAGS               ; Inicia mostrando Temperatura, medición inactiva
-    CLRF    BUZZ_STEP
-    CLRF    BPM_VAL
-    CLRF    TX_LEN
-    CLRF    TX_IDX
-    CLRF    MUX_IDX
+    CLRF    BANDERAS                    ; Inicia mostrando Temperatura, medición inactiva
+    CLRF    FRECUENCIA_BPM
+    CLRF    BYTES_PENDIENTES_TX
+    CLRF    INDICE_TX
+    CLRF    INDICE_MULTIPLEX
     MOVLW   b'11111110'
-    MOVWF   MUX_MASK
-    MOVLW   DISP_REF_TICKS
-    MOVWF   DISP_TMR
+    MOVWF   MASCARA_DIGITO
+    MOVLW   TICKS_REFRESCO_DISP
+    MOVWF   CONT_REFRESCO_DISP
 
-    CALL    INIT_PULSO_BG       ; Precarga buffer AN1 y pre-calibración continua
-    CALL    LEER_TEMP           ; Primera lectura válida antes de habilitar display
-    CALL    EVALUAR_TEMP
-    CALL    ACTUALIZAR_DISPLAY
+    CALL    INICIALIZAR_SENSOR_PULSO    ; Precarga buffer AN1 y pre-calibración continua
+    CALL    MEDIR_TEMPERATURA           ; Primera lectura válida antes de habilitar ISR
+    CALL    CONTROLAR_ALARMA_TEMP
+    CALL    ACTUALIZAR_PANTALLA_Y_TRAMA ; Prepara la primera trama UART (activa TXIE)
 
-    CFG_TIMER1                  ; Habilita Timer1, RX UART e interrupciones (Banco 0)
+    ;-----Arranque de Temporizadores e Interrupciones-----
+    CFG_TIMER0
+    CFG_TIMER1                          ; Habilita Timer1 y selecciona Banco 0
+    BSF     INTCON, PEIE                ; Habilita interrupciones de periféricos
+    BSF     INTCON, GIE                 ; Habilita interrupciones globales
 
 ;===============================================================================
 ; INICIO PROGRAMA PRINCIPAL
 ;===============================================================================        
 MAIN_LOOP  
-    BTFSS   INTCON, T0IF        ; Espera tick de 9.984 ms por desborde de Timer0
-    GOTO    MAIN_LOOP
-    BCF     INTCON, T0IF
-    MOVLW   TMR0_PRELOAD
-    MOVWF   TMR0
-
-    ; --- 1. Tarea permanente: Temperatura (AN0) y alarmas ---
-    CALL    LEER_TEMP
-    CALL    EVALUAR_TEMP
-
-    ; --- 2. Tarea permanente de pulsómetro: pre-calibración y conteo ---
-    BTFSC   FLAGS, F_CMD_START  ; ¿Se presionó 'I' en la PC?
-    CALL    INICIAR_MEDICION_PULSO
-
-    CALL    PROCESAR_PULSO      ; Corre continuo (pre-calibra en reposo y mide en activo)
-
-    ; --- 3. Transmisión no bloqueante de telemetría (1 byte por tick) ---
-    MOVF    TX_LEN, F
-    BTFSS   STATUS, Z
-    CALL    ENVIAR_BYTE_UART
-
-    ; --- 4. Actualización periódica (250 ms) o por cambio de vista ('V') ---
-    DECFSZ  DISP_TMR, F
-    GOTO    MAIN_LOOP
-    MOVLW   DISP_REF_TICKS
-    MOVWF   DISP_TMR
-    CALL    ACTUALIZAR_DISPLAY
-    GOTO    MAIN_LOOP
+    GOTO    MAIN_LOOP                   ; Ejecución gobernada íntegramente por la ISR
   
 ;===============================================================================
 ; INICIALIZACIÓN DE RUTINAS DE SERVICIO DE INTERRUPCIÓN
@@ -304,85 +296,32 @@ ISR_INICIO
     MOVWF   STATUS_TEMP
     MOVF    FSR, W
     MOVWF   FSR_TEMP
-    CLRF    STATUS              ; Selecciona Banco 0 e IRP=0
+    MOVF    PCLATH, W
+    MOVWF   PCLATH_TEMP
+    CLRF    STATUS                      ; Selecciona Banco 0 e IRP=0
+    CLRF    PCLATH                      ; Asegura Página 0 para saltos calculados
     ;----------------------------------------
-    ;-----Identificación de Interrupción----- 
-    ; 1) Interrupción de Timer1: Multiplexado del display (5 ms)
-    BTFSS   PIR1, TMR1IF
-    GOTO    CHECK_UART_RX
-    BCF     PIR1, TMR1IF
 
-    MOVLW   TMR1_PRELOAD_H      ; Recarga Timer1 (5 ms)
-    MOVWF   TMR1H
-    MOVLW   TMR1_PRELOAD_L
-    MOVWF   TMR1L
+    ;-----Identificación de Interrupción-----
+    ; 1) Interrupción de Timer1 (5 ms): Multiplexado del display
+    BTFSC   PIR1, TMR1IF
+    CALL    ATENDER_MULTIPLEX_DISPLAY
 
-    MOVLW   b'00001111'
-    IORWF   PORTC, F            ; Apaga dígitos RC0..RC3 preservando RC4 (buzzer)
-    MOVLW   DSPL_1
-    ADDWF   MUX_IDX, W
-    MOVWF   FSR
-    MOVF    INDF, W
-    MOVWF   PORTD               ; Carga segmentos del dígito activo
-    MOVF    PORTC, W
-    IORLW   b'00001111'
-    ANDWF   MUX_MASK, W
-    MOVWF   PORTC               ; Habilita dígito actual (0 en RC0..RC3)
+    ; 2) Interrupción de EUSART RX: Comandos desde teclado/web ('I', 'V' y 'G')
+    BTFSC   PIR1, RCIF
+    CALL    ATENDER_RECEPCION_UART
 
-    INCF    MUX_IDX, F
-    BSF     STATUS, C
-    RLF     MUX_MASK, F
-    MOVF    MUX_IDX, W
-    XORLW   d'4'
-    BTFSS   STATUS, Z
-    GOTO    CHECK_UART_RX
-    CLRF    MUX_IDX
-    MOVLW   b'11111110'
-    MOVWF   MUX_MASK
-
-    ; 2) Interrupción de EUSART RX: Comandos desde teclado/web ('I' y 'V')
-CHECK_UART_RX:
-    BTFSS   PIR1, RCIF
-    GOTO    ISR_FIN
-
-    BTFSS   RCSTA, OERR         ; Verifica error de saturación de buffer FIFO
-    GOTO    UART_READ_CHAR
-    BCF     RCSTA, CREN         ; Destraba receptor reiniciando CREN
-    BSF     RCSTA, CREN
-
-UART_READ_CHAR:
-    MOVF    RCREG, W            ; Lee carácter recibido (limpia RCIF)
-    MOVWF   RX_TEMP
-
-    ; ¿Tecla 'I' (0x49) o 'i' (0x69)? -> Iniciar adquisición de pulsos
-    XORLW   'I'
+    ; 3) Interrupción de EUSART TX: Envío de trama cuando TXREG está vacío
+    MOVF    BYTES_PENDIENTES_TX, F
     BTFSC   STATUS, Z
-    GOTO    UART_CMD_I
-    MOVF    RX_TEMP, W
-    XORLW   'i'
-    BTFSC   STATUS, Z
-    GOTO    UART_CMD_I
+    GOTO    VERIFICAR_TIMER0
+    BTFSC   PIR1, TXIF
+    CALL    ATENDER_TRANSMISION_UART
 
-    ; ¿Tecla 'V' (0x56) o 'v' (0x76)? -> Alternar variable en display
-    MOVF    RX_TEMP, W
-    XORLW   'V'
-    BTFSC   STATUS, Z
-    GOTO    UART_CMD_V
-    MOVF    RX_TEMP, W
-    XORLW   'v'
-    BTFSC   STATUS, Z
-    GOTO    UART_CMD_V
-    GOTO    ISR_FIN
-
-UART_CMD_I:
-    BSF     FLAGS, F_CMD_START
-    GOTO    ISR_FIN
-
-UART_CMD_V:
-    MOVLW   (1 << F_DISP_MODE)
-    XORWF   FLAGS, F            ; Invierte modo de display (0 <-> 1)
-    MOVLW   d'1'
-    MOVWF   DISP_TMR            ; Fuerza refresco inmediato en el próximo tick
+    ; 4) Interrupción de Timer0 (~10 ms): Adquisición ADC, control y refresco
+VERIFICAR_TIMER0
+    BTFSC   INTCON, T0IF
+    CALL    ADQUISICION_SENALES_ADC
     ;----------------------------------------   
     
 ;===============================================================================
@@ -390,6 +329,8 @@ UART_CMD_V:
 ;===============================================================================        
 ISR_FIN     
     ;--------Restauración de Contexto--------        
+    MOVF    PCLATH_TEMP, W
+    MOVWF   PCLATH
     MOVF    FSR_TEMP, W
     MOVWF   FSR
     SWAPF   STATUS_TEMP, W
@@ -398,612 +339,709 @@ ISR_FIN
     SWAPF   W_TEMP, W
     RETFIE
     ;---------------------------------------- 
- 
+
 ;===============================================================================
-; SUBRUTINAS
-;===============================================================================		
+; SUBRUTINAS DE ATENCIÓN A EVENTOS DE INTERRUPCIÓN
+;===============================================================================
 ;*******************************************************************************
-; @brief    Tabla de conversión BCD a 7 segmentos (ánodo común).
-;           
-; @details  Recibe un dígito decimal (0..9) en W y retorna el patrón en lógica
-;           negativa (bit0=a .. bit6=g, bit7=dp apagado). Ubicada en Página 0.
+; @brief    Atiende Timer1 (5 ms): multiplexa los 4 dígitos de 7 segmentos.
 ;*******************************************************************************
-TABLA_7SEG:
-    ADDWF   PCL, F
-    RETLW   0xC0                ; 0
-    RETLW   0xF9                ; 1
-    RETLW   0xA4                ; 2
-    RETLW   0xB0                ; 3
-    RETLW   0x99                ; 4
-    RETLW   0x92                ; 5
-    RETLW   0x82                ; 6
-    RETLW   0xF8                ; 7
-    RETLW   0x80                ; 8
-    RETLW   0x90                ; 9
+ATENDER_MULTIPLEX_DISPLAY
+    BCF     PIR1, TMR1IF
+    MOVLW   PRECARGA_TMR1_H             ; Recarga Timer1 (5 ms)
+    MOVWF   TMR1H
+    MOVLW   PRECARGA_TMR1_L
+    MOVWF   TMR1L
+
+    MOVLW   b'00001111'
+    IORWF   PORTC, F                    ; Apaga dígitos RC0..RC3 preservando RC4 (buzzer)
+    MOVLW   DIGITO_1
+    ADDWF   INDICE_MULTIPLEX, W
+    MOVWF   FSR
+    MOVF    INDF, W
+    MOVWF   PORTD                       ; Carga segmentos del dígito activo
+    MOVF    PORTC, W
+    IORLW   b'00001111'
+    ANDWF   MASCARA_DIGITO, W
+    MOVWF   PORTC                       ; Habilita dígito actual (0 en RC0..RC3)
+
+    INCF    INDICE_MULTIPLEX, F
+    BSF     STATUS, C
+    RLF     MASCARA_DIGITO, F
+    MOVF    INDICE_MULTIPLEX, W
+    XORLW   d'4'
+    BTFSS   STATUS, Z
+    RETURN
+    CLRF    INDICE_MULTIPLEX
+    MOVLW   b'11111110'
+    MOVWF   MASCARA_DIGITO
+    RETURN
 
 ;*******************************************************************************
-; @brief    Selecciona el canal ADC en W, espera adquisición y lee ADRESH.
-;           
-; @details  Espera ~45 us para asegurar carga completa del S&H al conmutar
-;           entre AN0 y AN1, y retorna los 8 bits altos en W.
+; @brief    Atiende EUSART RX: procesa comandos ASCII 'I'/'i', 'V'/'v' y 'G'/'g'.
 ;*******************************************************************************
-LEER_ADC_CANAL:
-    MOVWF   ADCON0              ; Selecciona canal ANx
-    MOVLW   d'15'               ; ~45 us de tiempo de adquisición
-    MOVWF   AUX_L
-    DECFSZ  AUX_L, F
+ATENDER_RECEPCION_UART
+    BTFSS   RCSTA, OERR                 ; Verifica error de saturación de buffer FIFO
+    GOTO    LEER_CARACTER_UART
+    BCF     RCSTA, CREN                 ; Destraba receptor reiniciando CREN
+    BSF     RCSTA, CREN
+
+LEER_CARACTER_UART
+    MOVF    RCREG, W                    ; Lee carácter recibido (limpia RCIF)
+    MOVWF   DATO_RX_UART
+    BCF     DATO_RX_UART, 5             ; Normaliza minúsculas ('i','v','g') a mayúsculas
+
+    ; ¿Tecla 'I' o 'i'? -> Inicia ventana de medición de pulsos (15 s)
+    MOVF    DATO_RX_UART, W
+    XORLW   'I'
+    BTFSC   STATUS, Z
+    GOTO    ARRANCAR_CONTEO_15S
+
+    ; ¿Tecla 'V' o 'v'? -> Alterna vista del display (Temperatura <-> Frecuencia)
+    MOVF    DATO_RX_UART, W
+    XORLW   'V'
+    BTFSC   STATUS, Z
+    GOTO    CONMUTAR_VISTA_DISPLAY
+
+    ; ¿Tecla 'G' o 'g'? -> Alterna salida CSV de ADC de pulso en vivo (100 Hz)
+    MOVF    DATO_RX_UART, W
+    XORLW   'G'
+    BTFSC   STATUS, Z
+    GOTO    CONMUTAR_MODO_GRAFICO
+    RETURN
+
+CONMUTAR_VISTA_DISPLAY
+    MOVLW   (1 << BIT_MODO_DISPLAY)
+    XORWF   BANDERAS, F                 ; Invierte modo de display (0 <-> 1)
+    MOVLW   d'1'
+    MOVWF   CONT_REFRESCO_DISP          ; Fuerza refresco inmediato en el próximo tick
+    RETURN
+
+CONMUTAR_MODO_GRAFICO
+    MOVLW   (1 << BIT_MODO_GRAFICO)
+    XORWF   BANDERAS, F                 ; Activa/desactiva streaming CSV "XXX,L\r\n"
+    RETURN
+
+;*******************************************************************************
+; @brief    Atiende EUSART TX: envía 1 byte de BUFFER_TRAMA_TX por hardware.
+;*******************************************************************************
+ATENDER_TRANSMISION_UART
+    BCF     STATUS, IRP                 ; Direccionamiento indirecto en Banco 0
+    MOVLW   BUFFER_TRAMA_TX
+    ADDWF   INDICE_TX, W
+    MOVWF   FSR
+    MOVF    INDF, W
+    MOVWF   TXREG                       ; Transmite carácter
+    INCF    INDICE_TX, F
+    DECFSZ  BYTES_PENDIENTES_TX, F
+    RETURN                              ; Aún quedan bytes pendientes
+
+    CLRF    INDICE_TX                   ; Trama completa enviada
+    BANKSEL PIE1
+    BCF     PIE1, TXIE                  ; Deshabilita interrupción TX hasta próxima trama
+    BANKSEL PORTB                       ; Retorna a Banco 0
+    RETURN
+
+;*******************************************************************************
+; @brief    Atiende Timer0 (~10 ms): adquiere señales ADC, evalúa alarmas y refresca.
+;*******************************************************************************
+ADQUISICION_SENALES_ADC
+    BCF     INTCON, T0IF
+    MOVLW   PRECARGA_TMR0               ; Recarga Timer0 (9.984 ms)
+    MOVWF   TMR0
+
+    ; --- 1. Tarea permanente: Temperatura (AN0) y control de alarmas ---
+    CALL    MEDIR_TEMPERATURA
+    CALL    CONTROLAR_ALARMA_TEMP
+
+    ; --- 2. Tarea permanente de pulsómetro: pre-calibración y conteo ---
+    CALL    PROCESAR_SENAL_PULSO
+
+    ; --- 3. Si el modo gráfico está activo, envía muestra CSV a 100 Hz ---
+    BTFSC   BANDERAS, BIT_MODO_GRAFICO
+    CALL    ENVIAR_TRAMA_ADC_PULSO
+
+    ; --- 4. Actualización periódica (250 ms) o por cambio de vista ('V') ---
+    DECFSZ  CONT_REFRESCO_DISP, F
+    RETURN
+    MOVLW   TICKS_REFRESCO_DISP
+    MOVWF   CONT_REFRESCO_DISP
+    CALL    ACTUALIZAR_PANTALLA_Y_TRAMA
+    RETURN
+ 
+;===============================================================================
+; SUBRUTINAS DE ADQUISICIÓN Y CONTROL DE TEMPERATURA
+;===============================================================================		
+;*******************************************************************************
+; @brief    Selecciona el canal ADC en W, espera adquisición y retorna ADRESH.
+;*******************************************************************************
+CONVERTIR_CANAL_ADC
+    MOVWF   ADCON0                      ; Selecciona canal ANx
+    MOVLW   d'15'                       ; ~45 us de tiempo de adquisición S&H
+    MOVWF   AUX_CALC_L
+    DECFSZ  AUX_CALC_L, F
     GOTO    $-1
-    BSF     ADCON0, 1           ; Inicia conversión (GO/DONE = 1)
-    BTFSC   ADCON0, 1           ; Espera fin de conversión
+    BSF     ADCON0, GO_DONE             ; Inicia conversión (GO/DONE = 1)
+    BTFSC   ADCON0, GO_DONE             ; Espera fin de conversión
     GOTO    $-1
     MOVF    ADRESH, W
     RETURN
 
 ;*******************************************************************************
-; @brief    Adquiere el canal AN0 (LM35) y convierte el resultado a °C enteros.
+; @brief    Adquiere AN0 (LM35) y convierte el resultado a °C redondeados.
 ;           
-; @details  Con Vref+ = 2.50 V y LM35 = 10 mV/°C, cada cuenta equivale a
-;           250/256 °C. Calcula TEMP_C = ((ADRESH << 8) - 6 * ADRESH) >> 8.
+; @details  Con Vref+ = 2.50 V y LM35 = 10 mV/°C:
+;           TEMP_ACTUAL_C = ((ADRESH << 8) + 128 - 6 * ADRESH) >> 8.
 ;******************************************************************************* 
-LEER_TEMP:
-    MOVLW   ADC_CH_AN0
-    CALL    LEER_ADC_CANAL
+MEDIR_TEMPERATURA
+    MOVLW   CANAL_ADC_TEMP
+    CALL    CONVERTIR_CANAL_ADC
 
-    MOVWF   PROD_H              ; PROD = ADRESH * 256
-    CLRF    PROD_L
-    MOVWF   AUX_L
-    CLRF    AUX_H
+    MOVWF   ACUM_16_H                   ; ACUM_16 = ADRESH * 256 + 128 (+0.5 redondeo)
+    MOVLW   d'128'
+    MOVWF   ACUM_16_L
+    MOVF    ACUM_16_H, W
+    MOVWF   AUX_CALC_L
+    CLRF    AUX_CALC_H
     BCF     STATUS, C
-    RLF     AUX_L, F            ; AUX = 2 * ADRESH
-    RLF     AUX_H, F
-    CALL    SUB_PROD_AUX        ; PROD -= 2 * ADRESH
+    RLF     AUX_CALC_L, F               ; AUX_CALC = 2 * ADRESH
+    RLF     AUX_CALC_H, F
+    CALL    RESTAR_16_BITS              ; ACUM_16 -= 2 * ADRESH
     BCF     STATUS, C
-    RLF     AUX_L, F            ; AUX = 4 * ADRESH
-    RLF     AUX_H, F
-    CALL    SUB_PROD_AUX        ; PROD -= 4 * ADRESH (total: 250 * ADRESH)
-    MOVF    PROD_H, W
-    MOVWF   TEMP_C
+    RLF     AUX_CALC_L, F               ; AUX_CALC = 4 * ADRESH
+    RLF     AUX_CALC_H, F
+    CALL    RESTAR_16_BITS              ; ACUM_16 -= 4 * ADRESH (total: 250 * ADRESH + 128)
+    MOVF    ACUM_16_H, W
+    MOVWF   TEMP_ACTUAL_C
     RETURN
 
-SUB_PROD_AUX:
-    MOVF    AUX_L, W
-    SUBWF   PROD_L, F
+RESTAR_16_BITS
+    MOVF    AUX_CALC_L, W
+    SUBWF   ACUM_16_L, F
     BTFSS   STATUS, C
-    DECF    PROD_H, F
-    MOVF    AUX_H, W
-    SUBWF   PROD_H, F
+    DECF    ACUM_16_H, F
+    MOVF    AUX_CALC_H, W
+    SUBWF   ACUM_16_H, F
     RETURN
 
 ;*******************************************************************************
-; @brief    Evalúa TEMP_C contra 40 °C y gobierna LEDs (RB6/RB7) y buzzer (RC4).
+; @brief    Evalúa TEMP_ACTUAL_C contra 40 °C y gobierna LEDs y buzzer (RC4).
 ;           
-; @details  Temp > 40 °C: RB7 ON, RB6 OFF, buzzer 0.25 s ON / 3.0 s OFF.
-;           Temp < 40 °C: RB7 OFF, RB6 ON, buzzer apagado.
+; @details  Temp > 40 °C : LED rojo RB7 ON, verde RB6 OFF, buzzer RC4 ON continuo.
+;           Temp <= 40 °C: LED rojo OFF, verde ON, buzzer OFF.
 ;******************************************************************************* 
-EVALUAR_TEMP:
-    MOVLW   TEMP_UMBRAL
-    SUBWF   TEMP_C, W           ; W = TEMP_C - 40
+CONTROLAR_ALARMA_TEMP
+    MOVLW   UMBRAL_TEMP_ALARMA + 1
+    SUBWF   TEMP_ACTUAL_C, W            ; C=1 si TEMP_ACTUAL_C >= 41 (> 40 °C)
     BTFSS   STATUS, C
-    GOTO    TEMP_BAJA           ; TEMP_C < 40 °C
-    BTFSC   STATUS, Z
-    GOTO    TEMP_IGUAL          ; TEMP_C == 40 °C
+    GOTO    ESTADO_TEMP_NORMAL          ; TEMP_ACTUAL_C <= 40 °C
 
-    BSF     PORTB, 7            ; Temp > 40 °C: LED rojo ON, verde OFF
+    BSF     PORTB, 7                    ; Temp > 40 °C: LED rojo ON, verde OFF
     BCF     PORTB, 6
-    MOVF    BUZZ_STEP, F
-    BTFSC   STATUS, Z
-    GOTO    BUZZ_START          ; Arranca ciclo si estaba apagado
-    DECFSZ  BUZZ_SUB, F
-    RETURN
-    MOVLW   BUZZ_SUB_TICKS      ; Pasaron 25 ticks (0.25 s)
-    MOVWF   BUZZ_SUB
-    DECFSZ  BUZZ_STEP, F
-    GOTO    BUZZ_SILENCIO
-BUZZ_START:
-    MOVLW   BUZZ_TOTAL_STEP     ; 1 paso ON (0.25 s) + 12 pasos OFF (3.0 s)
-    MOVWF   BUZZ_STEP
-    MOVLW   BUZZ_SUB_TICKS
-    MOVWF   BUZZ_SUB
-    BSF     PORTC, 4            ; Buzzer ON
-    RETURN
-BUZZ_SILENCIO:
-    BCF     PORTC, 4            ; Buzzer OFF
+    BSF     PORTC, 4                    ; Buzzer ON continuo
     RETURN
 
-TEMP_BAJA:
-    BCF     PORTB, 7            ; LED rojo OFF, verde ON
+ESTADO_TEMP_NORMAL
+    BCF     PORTB, 7                    ; Temp <= 40 °C: LED rojo OFF, verde ON
     BSF     PORTB, 6
-    CLRF    BUZZ_STEP
-    BCF     PORTC, 4
+    BCF     PORTC, 4                    ; Buzzer OFF
     RETURN
 
-TEMP_IGUAL:
-    BCF     PORTB, 7            ; Ambos LEDs OFF
-    BCF     PORTB, 6
-    CLRF    BUZZ_STEP
-    BCF     PORTC, 4
-    RETURN
-
+;===============================================================================
+; SUBRUTINAS DE PROCESAMIENTO DEL PULSÓMETRO (HW-827)
+;===============================================================================
 ;*******************************************************************************
 ; @brief    Inicializa en el arranque el buffer de AN1 y la pre-calibración.
 ;*******************************************************************************
-INIT_PULSO_BG:
-    CLRF    REFRACT
-    CLRF    MAX_DROP
-    MOVLW   DECAY_TICKS
-    MOVWF   DECAY_TMR
-    MOVLW   DROP_THRESH_IDLE    ; Arranca en 5 (rechaza ruido hasta detectar pulso)
-    MOVWF   DROP_THRESH
+INICIALIZAR_SENSOR_PULSO
+    CLRF    CONT_BLOQUEO_LATIDO
+    CLRF    CAIDA_MAX_RECIENTE
+    MOVLW   TICKS_DECAIMIENTO
+    MOVWF   CONT_DECAIMIENTO
+    MOVLW   UMBRAL_CAIDA_REPOSO         ; Arranca en 5 (rechaza ruido hasta detectar pulso)
+    MOVWF   UMBRAL_CAIDA_ACTUAL
 
-    MOVLW   ADC_CH_AN1          ; Precarga buffer circular de 18 muestras
-    CALL    LEER_ADC_CANAL
-    MOVWF   PULSE_ADC
+    MOVLW   CANAL_ADC_PULSO             ; Precarga buffer circular de 18 muestras
+    CALL    CONVERTIR_CANAL_ADC
+    MOVWF   MUESTRA_ADC_PULSO
 
-    BCF     STATUS, IRP         ; Direccionamiento indirecto en Banco 0
-    MOVLW   PULSE_BUF
+    BCF     STATUS, IRP                 ; Direccionamiento indirecto en Banco 0
+    MOVLW   BUFFER_MUESTRAS_PULSO
     MOVWF   FSR
     MOVLW   d'18'
-    MOVWF   AUX_L
-IPB_FILL:
-    MOVF    PULSE_ADC, W
+    MOVWF   AUX_CALC_L
+LLENAR_BUFFER_INICIAL
+    MOVF    MUESTRA_ADC_PULSO, W
     MOVWF   INDF
     INCF    FSR, F
-    DECFSZ  AUX_L, F
-    GOTO    IPB_FILL
+    DECFSZ  AUX_CALC_L, F
+    GOTO    LLENAR_BUFFER_INICIAL
     RETURN
 
 ;*******************************************************************************
-; @brief    Calcula DROP_THRESH en función de MAX_DROP actual.
-;           
-; @details  Si MAX_DROP < 6 (sin pulso confirmado): DROP_THRESH = 5.
-;           Si MAX_DROP >= 6 (pulso confirmado): DROP_THRESH = clamp(MAX_DROP/2, 4, 9).
+; @brief    Calcula UMBRAL_CAIDA_ACTUAL en función de CAIDA_MAX_RECIENTE.
 ;*******************************************************************************
-ACTUALIZAR_UMBRAL:
+RECALCULAR_UMBRAL_PULSO
     MOVLW   d'6'
-    SUBWF   MAX_DROP, W         ; C=1 si MAX_DROP >= 6
+    SUBWF   CAIDA_MAX_RECIENTE, W       ; C=1 si CAIDA_MAX_RECIENTE >= 6
     BTFSC   STATUS, C
-    GOTO    AU_CON_PULSO
-    MOVLW   DROP_THRESH_IDLE    ; Sin pulso confirmado: umbral = 5
-    MOVWF   DROP_THRESH
+    GOTO    AJUSTAR_UMBRAL_ACTIVO
+    MOVLW   UMBRAL_CAIDA_REPOSO         ; Sin pulso confirmado: umbral = 5
+    MOVWF   UMBRAL_CAIDA_ACTUAL
     RETURN
 
-AU_CON_PULSO:
+AJUSTAR_UMBRAL_ACTIVO
     BCF     STATUS, C
-    RRF     MAX_DROP, W         ; W = MAX_DROP / 2
-    MOVWF   AUX_L
+    RRF     CAIDA_MAX_RECIENTE, W       ; W = CAIDA_MAX_RECIENTE / 2
+    MOVWF   AUX_CALC_L
 
-    MOVLW   DROP_THRESH_MIN     ; Piso mínimo = 4
-    SUBWF   AUX_L, W
-    MOVLW   DROP_THRESH_MIN
+    MOVLW   UMBRAL_CAIDA_MIN            ; Piso mínimo = 4
+    SUBWF   AUX_CALC_L, W
+    MOVLW   UMBRAL_CAIDA_MIN
     BTFSC   STATUS, C
-    MOVF    AUX_L, W
-    MOVWF   AUX_L
+    MOVF    AUX_CALC_L, W
+    MOVWF   AUX_CALC_L
 
-    MOVLW   DROP_THRESH_MAX + 1 ; Techo máximo = 9
-    SUBWF   AUX_L, W
-    MOVLW   DROP_THRESH_MAX
+    MOVLW   UMBRAL_CAIDA_MAX + 1        ; Techo máximo = 9
+    SUBWF   AUX_CALC_L, W
+    MOVLW   UMBRAL_CAIDA_MAX
     BTFSS   STATUS, C
-    MOVF    AUX_L, W
-    MOVWF   DROP_THRESH
+    MOVF    AUX_CALC_L, W
+    MOVWF   UMBRAL_CAIDA_ACTUAL
     RETURN
 
 ;*******************************************************************************
-; @brief    Inicia la ventana de conteo (15 s) usando los umbrales ya calibrados.
-;           
-; @details  Conserva PULSE_BUF y DROP_THRESH pre-calibrados en segundo plano,
-;           cambia el display a Frecuencia (t-15 .. t-01) y resetea PULSE_COUNT.
+; @brief    Inicia la ventana de conteo (15 s) usando los umbrales calibrados.
 ;*******************************************************************************
-INICIAR_MEDICION_PULSO:
-    BCF     FLAGS, F_CMD_START
-    BSF     FLAGS, F_MEAS_ACTIVE
-    BSF     FLAGS, F_DISP_MODE  ; Cambia automáticamente el display a Frecuencia
+ARRANCAR_CONTEO_15S
+    BSF     BANDERAS, BIT_MIDIENDO_PULSO
+    BSF     BANDERAS, BIT_MODO_DISPLAY  ; Cambia automáticamente el display a Frecuencia
 
-    MOVLW   MEAS_SECONDS        ; Arranca cuenta regresiva en 15 s (t-15)
-    MOVWF   COUNTDOWN_SEC
-    MOVLW   TICKS_PER_SEC       ; 100 ticks (~1 s) por segundo regresivo
-    MOVWF   SEC_SUB_TMR
-    CLRF    PULSE_COUNT
+    MOVLW   SEGUNDOS_MEDICION           ; Arranca cuenta regresiva en 15 s (t-15)
+    MOVWF   SEGUNDOS_RESTANTES
+    MOVLW   TICKS_POR_SEGUNDO           ; 100 ticks (~1 s) por segundo regresivo
+    MOVWF   CONT_TICKS_SEGUNDO
+    CLRF    CONTADOR_LATIDOS
 
     MOVLW   d'1'
-    MOVWF   DISP_TMR            ; Refresca display inmediatamente (muestra t-15)
+    MOVWF   CONT_REFRESCO_DISP          ; Refresca display inmediatamente (muestra t-15)
+    RETURN
+
+;*******************************************************************************
+; @brief    Suma 4 muestras consecutivas apuntadas por FSR en ACUM_16_H:L.
+;*******************************************************************************
+CALCULAR_FILTRO_4_MUESTRAS
+    CLRF    ACUM_16_L
+    CLRF    ACUM_16_H
+    MOVLW   d'4'
+    MOVWF   AUX_CALC_L
+LAZO_SUMA_FIR
+    MOVF    INDF, W
+    ADDWF   ACUM_16_L, F
+    BTFSC   STATUS, C
+    INCF    ACUM_16_H, F
+    INCF    FSR, F
+    DECFSZ  AUX_CALC_L, F
+    GOTO    LAZO_SUMA_FIR
     RETURN
 
 ;*******************************************************************************
 ; @brief    Adquiere AN1, filtra 50 Hz (FIR 4-tap), pre-calibra umbrales de
-;           forma continua y cuenta latidos cuando F_MEAS_ACTIVE = 1.
+;           forma continua y cuenta latidos cuando BIT_MIDIENDO_PULSO = 1.
 ;*******************************************************************************
-PROCESAR_PULSO:
-    MOVLW   ADC_CH_AN1
-    CALL    LEER_ADC_CANAL
-    MOVWF   PULSE_ADC
+PROCESAR_SENAL_PULSO
+    MOVLW   CANAL_ADC_PULSO
+    CALL    CONVERTIR_CANAL_ADC
+    MOVWF   MUESTRA_ADC_PULSO
 
-    MOVF    REFRACT, F          ; Descuenta bloqueo refractario si está activo
+    MOVF    CONT_BLOQUEO_LATIDO, F      ; Descuenta bloqueo refractario si está activo
     BTFSS   STATUS, Z
-    DECF    REFRACT, F
+    DECF    CONT_BLOQUEO_LATIDO, F
 
-    ; --- 1. Decaimiento lento de MAX_DROP (cada 1.5 s) para bajar umbral solo ---
-    DECFSZ  DECAY_TMR, F
-    GOTO    PP_SHIFT_START
-    MOVLW   DECAY_TICKS
-    MOVWF   DECAY_TMR
-    MOVF    MAX_DROP, F
+    ; --- 1. Decaimiento lento de CAIDA_MAX_RECIENTE (cada 1.5 s) ---
+    DECFSZ  CONT_DECAIMIENTO, F
+    GOTO    DESPLAZAR_BUFFER_PULSO
+    MOVLW   TICKS_DECAIMIENTO
+    MOVWF   CONT_DECAIMIENTO
+    MOVF    CAIDA_MAX_RECIENTE, F
     BTFSS   STATUS, Z
-    DECF    MAX_DROP, F
-    CALL    ACTUALIZAR_UMBRAL
+    DECF    CAIDA_MAX_RECIENTE, F
+    CALL    RECALCULAR_UMBRAL_PULSO
 
-    ; --- 2. Desplaza buffer circular de 18 muestras (PULSE_BUF[17..0]) ---
-PP_SHIFT_START:
-    BCF     STATUS, IRP         ; Direccionamiento indirecto en Banco 0
-    MOVLW   PULSE_BUF + d'16'
+    ; --- 2. Desplaza buffer circular de 18 muestras (BUFFER[17..0]) ---
+DESPLAZAR_BUFFER_PULSO
+    BCF     STATUS, IRP                 ; Direccionamiento indirecto en Banco 0
+    MOVLW   BUFFER_MUESTRAS_PULSO + d'16'
     MOVWF   FSR
     MOVLW   d'17'
-    MOVWF   AUX_L
-PP_SHIFT_BUF:
-    MOVF    INDF, W             ; Lee PULSE_BUF[i]
+    MOVWF   AUX_CALC_L
+LAZO_DESPLAZAR_BUF
+    MOVF    INDF, W                     ; Lee BUFFER[i]
     INCF    FSR, F
-    MOVWF   INDF                ; Escribe en PULSE_BUF[i+1]
+    MOVWF   INDF                        ; Escribe en BUFFER[i+1]
     DECF    FSR, F
     DECF    FSR, F
-    DECFSZ  AUX_L, F
-    GOTO    PP_SHIFT_BUF
-    MOVF    PULSE_ADC, W
-    MOVWF   PULSE_BUF           ; PULSE_BUF[0] = muestra actual
+    DECFSZ  AUX_CALC_L, F
+    GOTO    LAZO_DESPLAZAR_BUF
+    MOVF    MUESTRA_ADC_PULSO, W
+    MOVWF   BUFFER_MUESTRAS_PULSO       ; BUFFER[0] = muestra actual
 
-    ; --- 3. Suma FIR 4 muestras actuales: S4_NOW = BUF[0]+BUF[1]+BUF[2]+BUF[3] ---
-    CLRF    S4_NOW_H
-    MOVF    PULSE_BUF + d'0', W
-    MOVWF   S4_NOW_L
+    ; --- 3. Suma FIR 4 muestras actuales: SUMA_FIR_ACTUAL = BUF[0..3] ---
+    MOVLW   BUFFER_MUESTRAS_PULSO
+    MOVWF   FSR
+    CALL    CALCULAR_FILTRO_4_MUESTRAS
+    MOVF    ACUM_16_L, W
+    MOVWF   SUMA_FIR_ACTUAL_L
+    MOVF    ACUM_16_H, W
+    MOVWF   SUMA_FIR_ACTUAL_H
 
-    MOVF    PULSE_BUF + d'1', W
-    ADDWF   S4_NOW_L, F
-    BTFSC   STATUS, C
-    INCF    S4_NOW_H, F
+    ; --- 4. Suma FIR de hace 140 ms: SUMA_FIR_ANTERIOR = BUF[14..17] ---
+    MOVLW   BUFFER_MUESTRAS_PULSO + d'14'
+    MOVWF   FSR
+    CALL    CALCULAR_FILTRO_4_MUESTRAS
+    MOVF    ACUM_16_L, W
+    MOVWF   SUMA_FIR_ANTERIOR_L
+    MOVF    ACUM_16_H, W
+    MOVWF   SUMA_FIR_ANTERIOR_H
 
-    MOVF    PULSE_BUF + d'2', W
-    ADDWF   S4_NOW_L, F
-    BTFSC   STATUS, C
-    INCF    S4_NOW_H, F
-
-    MOVF    PULSE_BUF + d'3', W
-    ADDWF   S4_NOW_L, F
-    BTFSC   STATUS, C
-    INCF    S4_NOW_H, F
-
-    ; --- 4. Suma FIR de hace 140 ms: S4_OLD = BUF[14]+BUF[15]+BUF[16]+BUF[17] ---
-    CLRF    S4_OLD_H
-    MOVF    PULSE_BUF + d'14', W
-    MOVWF   S4_OLD_L
-
-    MOVF    PULSE_BUF + d'15', W
-    ADDWF   S4_OLD_L, F
-    BTFSC   STATUS, C
-    INCF    S4_OLD_H, F
-
-    MOVF    PULSE_BUF + d'16', W
-    ADDWF   S4_OLD_L, F
-    BTFSC   STATUS, C
-    INCF    S4_OLD_H, F
-
-    MOVF    PULSE_BUF + d'17', W
-    ADDWF   S4_OLD_L, F
-    BTFSC   STATUS, C
-    INCF    S4_OLD_H, F
-
-    ; --- 5. Caída sistólica con signo: DROP (en S4_OLD_H:L) = S4_OLD - S4_NOW ---
-    MOVF    S4_NOW_L, W
-    SUBWF   S4_OLD_L, F
+    ; --- 5. Caída sistólica con signo: CAIDA = SUMA_FIR_ANTERIOR - SUMA_FIR_ACTUAL ---
+    MOVF    SUMA_FIR_ACTUAL_L, W
+    SUBWF   SUMA_FIR_ANTERIOR_L, F
     BTFSS   STATUS, C
-    DECF    S4_OLD_H, F
-    MOVF    S4_NOW_H, W
-    SUBWF   S4_OLD_H, F
+    DECF    SUMA_FIR_ANTERIOR_H, F
+    MOVF    SUMA_FIR_ACTUAL_H, W
+    SUBWF   SUMA_FIR_ANTERIOR_H, F
 
-    ; --- 6. Histéresis de rearmado: si DROP <= 1, libera F_PULSE_LOCK ---
-    BTFSC   S4_OLD_H, 7         ; ¿DROP < 0?
-    GOTO    PP_REARMAR
-    MOVF    S4_OLD_H, F
-    BTFSS   STATUS, Z           ; ¿DROP >= 256?
-    GOTO    PP_EVAL_DISPARO
+    ; --- 6. Histéresis de rearmado: si CAIDA <= 1, libera BIT_LATIDO_DETECTADO ---
+    BTFSC   SUMA_FIR_ANTERIOR_H, 7      ; ¿CAIDA < 0?
+    GOTO    REARMAR_DETECTOR_PULSO
+    MOVF    SUMA_FIR_ANTERIOR_H, F
+    BTFSS   STATUS, Z                   ; ¿CAIDA >= 256?
+    GOTO    EVALUAR_DISPARO_LATIDO
     MOVLW   d'2'
-    SUBWF   S4_OLD_L, W         ; C=0 si DROP < 2 (es decir, DROP <= 1)
+    SUBWF   SUMA_FIR_ANTERIOR_L, W      ; C=0 si CAIDA < 2 (es decir, CAIDA <= 1)
     BTFSC   STATUS, C
-    GOTO    PP_EVAL_DISPARO
+    GOTO    EVALUAR_DISPARO_LATIDO
 
-PP_REARMAR:
-    BCF     FLAGS, F_PULSE_LOCK
-    GOTO    PP_CHECK_VENTANA
+REARMAR_DETECTOR_PULSO
+    BCF     BANDERAS, BIT_LATIDO_DETECTADO
+    GOTO    ACTUALIZAR_RELOJ_MEDICION
 
-    ; --- 7. Evaluación de latido: DROP >= DROP_THRESH, libre y sin refract ---
-PP_EVAL_DISPARO:
-    BTFSC   FLAGS, F_PULSE_LOCK
-    GOTO    PP_ADAPTAR_UMBRAL
-    MOVF    REFRACT, F
+    ; --- 7. Evaluación de latido: CAIDA >= UMBRAL_CAIDA_ACTUAL y sin bloqueo ---
+EVALUAR_DISPARO_LATIDO
+    BTFSC   BANDERAS, BIT_LATIDO_DETECTADO
+    GOTO    ADAPTAR_UMBRAL_SISTOLICO
+    MOVF    CONT_BLOQUEO_LATIDO, F
     BTFSS   STATUS, Z
-    GOTO    PP_CHECK_VENTANA
+    GOTO    ACTUALIZAR_RELOJ_MEDICION
 
-    MOVF    S4_OLD_H, F
-    BTFSS   STATUS, Z           ; Si S4_OLD_H > 0, DROP >= 256 >= DROP_THRESH
-    GOTO    PP_LATIDO_VALIDO
-    MOVF    DROP_THRESH, W
-    SUBWF   S4_OLD_L, W         ; C=1 si S4_OLD_L >= DROP_THRESH
+    MOVF    SUMA_FIR_ANTERIOR_H, F
+    BTFSS   STATUS, Z                   ; Si byte alto > 0, CAIDA >= 256 >= UMBRAL
+    GOTO    REGISTRAR_LATIDO_VALIDO
+    MOVF    UMBRAL_CAIDA_ACTUAL, W
+    SUBWF   SUMA_FIR_ANTERIOR_L, W      ; C=1 si CAIDA >= UMBRAL_CAIDA_ACTUAL
     BTFSS   STATUS, C
-    GOTO    PP_CHECK_VENTANA
+    GOTO    ACTUALIZAR_RELOJ_MEDICION
 
-PP_LATIDO_VALIDO:
-    BTFSC   FLAGS, F_MEAS_ACTIVE ; Solo suma latidos si la ventana de 15 s está activa
-    INCF    PULSE_COUNT, F
-    BSF     FLAGS, F_PULSE_LOCK
-    MOVLW   REFRACT_TICKS
-    MOVWF   REFRACT
+REGISTRAR_LATIDO_VALIDO
+    BTFSC   BANDERAS, BIT_MIDIENDO_PULSO ; Solo suma latidos si ventana de 15 s activa
+    INCF    CONTADOR_LATIDOS, F
+    BSF     BANDERAS, BIT_LATIDO_DETECTADO
+    MOVLW   TICKS_BLOQUEO_LATIDO
+    MOVWF   CONT_BLOQUEO_LATIDO
 
-    ; --- 8. Pre-calibración continua de MAX_DROP y DROP_THRESH ---
-PP_ADAPTAR_UMBRAL:
-    MOVF    S4_OLD_H, F
-    BTFSS   STATUS, Z           ; Ignora transitorios > 28
-    GOTO    PP_CHECK_VENTANA
-    MOVLW   DROP_TRANS_LIM + 1
-    SUBWF   S4_OLD_L, W
+    ; --- 8. Pre-calibración continua de CAIDA_MAX_RECIENTE y umbral ---
+ADAPTAR_UMBRAL_SISTOLICO
+    MOVF    SUMA_FIR_ANTERIOR_H, F
+    BTFSS   STATUS, Z                   ; Ignora transitorios > 28
+    GOTO    ACTUALIZAR_RELOJ_MEDICION
+    MOVLW   LIMITE_RUIDO_TRANS + 1
+    SUBWF   SUMA_FIR_ANTERIOR_L, W
     BTFSC   STATUS, C
-    GOTO    PP_CHECK_VENTANA
+    GOTO    ACTUALIZAR_RELOJ_MEDICION
 
-    MOVLW   DROP_CAP_MAX + 1    ; Acota caída almacenada en 18 para decaimiento ágil
-    SUBWF   S4_OLD_L, W
-    MOVLW   DROP_CAP_MAX
+    MOVLW   TOPE_CAIDA_MAX + 1          ; Acota caída almacenada en 18
+    SUBWF   SUMA_FIR_ANTERIOR_L, W
+    MOVLW   TOPE_CAIDA_MAX
     BTFSS   STATUS, C
-    MOVF    S4_OLD_L, W
-    MOVWF   AUX_L
+    MOVF    SUMA_FIR_ANTERIOR_L, W
+    MOVWF   AUX_CALC_L
 
-    MOVF    AUX_L, W            ; Actualiza MAX_DROP si AUX_L > MAX_DROP
-    SUBWF   MAX_DROP, W
+    MOVF    AUX_CALC_L, W               ; Actualiza si AUX_CALC_L > CAIDA_MAX_RECIENTE
+    SUBWF   CAIDA_MAX_RECIENTE, W
     BTFSC   STATUS, C
-    GOTO    PP_CHECK_VENTANA
+    GOTO    ACTUALIZAR_RELOJ_MEDICION
 
-    MOVF    AUX_L, W
-    MOVWF   MAX_DROP
-    CALL    ACTUALIZAR_UMBRAL
+    MOVF    AUX_CALC_L, W
+    MOVWF   CAIDA_MAX_RECIENTE
+    CALL    RECALCULAR_UMBRAL_PULSO
 
     ; --- 9. Temporización de 1 s (100 ticks) solo si medición activa ---
-PP_CHECK_VENTANA:
-    BTFSS   FLAGS, F_MEAS_ACTIVE
+ACTUALIZAR_RELOJ_MEDICION
+    BTFSS   BANDERAS, BIT_MIDIENDO_PULSO
     RETURN
 
-    DECFSZ  SEC_SUB_TMR, F
+    DECFSZ  CONT_TICKS_SEGUNDO, F
     RETURN
-    MOVLW   TICKS_PER_SEC
-    MOVWF   SEC_SUB_TMR
+    MOVLW   TICKS_POR_SEGUNDO
+    MOVWF   CONT_TICKS_SEGUNDO
 
     MOVLW   d'1'
-    MOVWF   DISP_TMR            ; Actualiza display inmediatamente cada segundo
-    DECFSZ  COUNTDOWN_SEC, F
-    RETURN                      ; Aún quedan segundos (14..1)
+    MOVWF   CONT_REFRESCO_DISP          ; Actualiza display inmediatamente cada segundo
+    DECFSZ  SEGUNDOS_RESTANTES, F
+    RETURN                              ; Aún quedan segundos (14..1)
 
-    ; --- Fin de los 15 s: calcula BPM = PULSE_COUNT * 4 (0 si no hubo pulsos) ---
-    BCF     FLAGS, F_MEAS_ACTIVE
-    MOVF    PULSE_COUNT, W
-    MOVWF   BPM_VAL
+    ; --- Fin de los 15 s: calcula BPM = CONTADOR_LATIDOS * 4 ---
+    BCF     BANDERAS, BIT_MIDIENDO_PULSO
+    MOVF    CONTADOR_LATIDOS, W
+    MOVWF   FRECUENCIA_BPM
     BCF     STATUS, C
-    RLF     BPM_VAL, F          ; x2
+    RLF     FRECUENCIA_BPM, F           ; x2
     MOVLW   0xFF
     BTFSC   STATUS, C
-    MOVWF   BPM_VAL             ; Satura en 255 si desbordó
+    MOVWF   FRECUENCIA_BPM              ; Satura en 255 si desbordó
     BCF     STATUS, C
-    RLF     BPM_VAL, F          ; x4
+    RLF     FRECUENCIA_BPM, F           ; x4
     MOVLW   0xFF
     BTFSC   STATUS, C
-    MOVWF   BPM_VAL             ; Satura en 255 si desbordó
+    MOVWF   FRECUENCIA_BPM              ; Satura en 255 si desbordó
+    RETURN
+
+;===============================================================================
+; SUBRUTINAS DE FORMATEO DECIMAL, DISPLAY Y TELEMETRÍA UART
+;===============================================================================
+;*******************************************************************************
+; @brief    Carga TEMP_ACTUAL_C en UNIDADES saturado a un máximo de 99 °C.
+;*******************************************************************************
+LIMITAR_TEMP_A_99
+    MOVF    TEMP_ACTUAL_C, W
+    SUBLW   d'99'                       ; C=0 si TEMP_ACTUAL_C > 99
+    MOVF    TEMP_ACTUAL_C, W
+    BTFSS   STATUS, C
+    MOVLW   d'99'
+    MOVWF   UNIDADES
     RETURN
 
 ;*******************************************************************************
-; @brief    Divide UNITS entre 10: cociente en TENS y resto en UNITS.
+; @brief    Convierte el byte en W (0..255) a BCD: CENTENAS, DECENAS y UNIDADES.
 ;*******************************************************************************
-DIV_UNITS_10:
-    CLRF    TENS
-DU10_LOOP:
+CONVERTIR_A_3_DIGITOS
+    MOVWF   UNIDADES
+    CLRF    CENTENAS
+LAZO_RESTAR_100
+    MOVLW   d'100'
+    SUBWF   UNIDADES, W
+    BTFSS   STATUS, C
+    GOTO    EXTRAER_DECENAS_UNIDADES
+    MOVWF   UNIDADES
+    INCF    CENTENAS, F
+    GOTO    LAZO_RESTAR_100
+
+;*******************************************************************************
+; @brief    Divide UNIDADES entre 10: cociente en DECENAS y resto en UNIDADES.
+;*******************************************************************************
+EXTRAER_DECENAS_UNIDADES
+    CLRF    DECENAS
+LAZO_RESTAR_10
     MOVLW   d'10'
-    SUBWF   UNITS, W
+    SUBWF   UNIDADES, W
     BTFSS   STATUS, C
     RETURN
-    MOVWF   UNITS
-    INCF    TENS, F
-    GOTO    DU10_LOOP
+    MOVWF   UNIDADES
+    INCF    DECENAS, F
+    GOTO    LAZO_RESTAR_10
 
 ;*******************************************************************************
-; @brief    Actualiza los 4 dígitos del display y prepara la trama UART TX.
+; @brief    Actualiza los 4 dígitos del display y dispara la trama UART TX.
 ;******************************************************************************* 
-ACTUALIZAR_DISPLAY:
-    BTFSC   FLAGS, F_DISP_MODE
-    GOTO    MOSTRAR_FREC
+ACTUALIZAR_PANTALLA_Y_TRAMA
+    BTFSC   BANDERAS, BIT_MODO_DISPLAY
+    GOTO    CARGAR_VISTA_FRECUENCIA
 
 ; --- Formateo de Temperatura: [Decena][Unidad][°][C] ---
-MOSTRAR_TEMP:
-    MOVF    TEMP_C, W
-    MOVWF   UNITS
-    MOVLW   d'100'
-    SUBWF   UNITS, W
-    BTFSS   STATUS, C
-    GOTO    $+3
-    MOVLW   d'99'               ; Satura en 99 °C
-    MOVWF   UNITS
-
-    CALL    DIV_UNITS_10
-    MOVF    TENS, W
+CARGAR_VISTA_TEMPERATURA
+    CALL    LIMITAR_TEMP_A_99
+    CALL    EXTRAER_DECENAS_UNIDADES
+    MOVF    DECENAS, W
     CALL    TABLA_7SEG
-    MOVWF   DSPL_1              ; Dígito 1: Decena
-    MOVF    UNITS, W
+    MOVWF   DIGITO_1                    ; Dígito 1: Decena
+    MOVF    UNIDADES, W
     CALL    TABLA_7SEG
-    MOVWF   DSPL_2              ; Dígito 2: Unidad
-    MOVLW   SEG_DEG             ; Dígito 3: '°' (segmentos a, b, f, g)
-    MOVWF   DSPL_3
-    MOVLW   SEG_C               ; Dígito 4: 'C'
-    MOVWF   DSPL_4
-    GOTO    PREPARAR_TRAMA_UART
+    MOVWF   DIGITO_2                    ; Dígito 2: Unidad
+    MOVLW   CARACTER_GRADO              ; Dígito 3: '°'
+    MOVWF   DIGITO_3
+    MOVLW   CARACTER_C                  ; Dígito 4: 'C'
+    MOVWF   DIGITO_4
+    GOTO    ARMAR_Y_ENVIAR_TRAMA_UART
 
 ; --- Formateo de Cuenta Regresiva (t-15..t-01) o Frecuencia (FXXX / F---) ---
-MOSTRAR_FREC:
-    BTFSS   FLAGS, F_MEAS_ACTIVE
-    GOTO    MF_RESULTADO
+CARGAR_VISTA_FRECUENCIA
+    BTFSS   BANDERAS, BIT_MIDIENDO_PULSO
+    GOTO    MOSTRAR_RESULTADO_BPM
 
     ; Medición en curso: muestra [t][-][Decena][Unidad]
-    MOVLW   SEG_T
-    MOVWF   DSPL_1              ; Dígito 1: 't'
-    MOVLW   SEG_DASH
-    MOVWF   DSPL_2              ; Dígito 2: '-'
+    MOVLW   CARACTER_T
+    MOVWF   DIGITO_1                    ; Dígito 1: 't'
+    MOVLW   CARACTER_GUION
+    MOVWF   DIGITO_2                    ; Dígito 2: '-'
 
-    MOVF    COUNTDOWN_SEC, W
-    MOVWF   UNITS
-    CALL    DIV_UNITS_10
-    MOVF    TENS, W
+    MOVF    SEGUNDOS_RESTANTES, W
+    MOVWF   UNIDADES
+    CALL    EXTRAER_DECENAS_UNIDADES
+    MOVF    DECENAS, W
     CALL    TABLA_7SEG
-    MOVWF   DSPL_3              ; Dígito 3: Decena de segundos (1 o 0)
-    MOVF    UNITS, W
+    MOVWF   DIGITO_3                    ; Dígito 3: Decena de segundos
+    MOVF    UNIDADES, W
     CALL    TABLA_7SEG
-    MOVWF   DSPL_4              ; Dígito 4: Unidad de segundos (5..0 / 9..1)
-    GOTO    PREPARAR_TRAMA_UART
+    MOVWF   DIGITO_4                    ; Dígito 4: Unidad de segundos
+    GOTO    ARMAR_Y_ENVIAR_TRAMA_UART
 
-    ; Medición finalizada: muestra F--- si BPM_VAL = 0, o FXXX si > 0
-MF_RESULTADO:
-    MOVLW   SEG_F               ; Dígito 1: 'F'
-    MOVWF   DSPL_1
+    ; Medición finalizada: muestra F--- si FRECUENCIA_BPM = 0, o FXXX si > 0
+MOSTRAR_RESULTADO_BPM
+    MOVLW   CARACTER_F                  ; Dígito 1: 'F'
+    MOVWF   DIGITO_1
 
-    MOVF    BPM_VAL, F
+    MOVF    FRECUENCIA_BPM, F
     BTFSS   STATUS, Z
-    GOTO    MF_CALC_BCD
-    MOVLW   SEG_DASH
-    MOVWF   DSPL_2
-    MOVWF   DSPL_3
-    MOVWF   DSPL_4
-    GOTO    PREPARAR_TRAMA_UART
+    GOTO    FORMATEAR_DIGITOS_BPM
+    MOVLW   CARACTER_GUION
+    MOVWF   DIGITO_2
+    MOVWF   DIGITO_3
+    MOVWF   DIGITO_4
+    GOTO    ARMAR_Y_ENVIAR_TRAMA_UART
 
-MF_CALC_BCD:
-    MOVF    BPM_VAL, W
-    MOVWF   UNITS
-    CLRF    HUNDREDS
-
-MF_DIV100:
-    MOVLW   d'100'
-    SUBWF   UNITS, W
-    BTFSS   STATUS, C
-    GOTO    MF_WRITE
-    MOVWF   UNITS
-    INCF    HUNDREDS, F
-    GOTO    MF_DIV100
-
-MF_WRITE:
-    CALL    DIV_UNITS_10
-    MOVF    HUNDREDS, W
+FORMATEAR_DIGITOS_BPM
+    MOVF    FRECUENCIA_BPM, W
+    CALL    CONVERTIR_A_3_DIGITOS
+    MOVF    CENTENAS, W
     CALL    TABLA_7SEG
-    MOVWF   DSPL_2              ; Dígito 2: Centena de BPM
-    MOVF    TENS, W
+    MOVWF   DIGITO_2                    ; Dígito 2: Centena de BPM
+    MOVF    DECENAS, W
     CALL    TABLA_7SEG
-    MOVWF   DSPL_3              ; Dígito 3: Decena de BPM
-    MOVF    UNITS, W
+    MOVWF   DIGITO_3                    ; Dígito 3: Decena de BPM
+    MOVF    UNIDADES, W
     CALL    TABLA_7SEG
-    MOVWF   DSPL_4              ; Dígito 4: Unidad de BPM
+    MOVWF   DIGITO_4                    ; Dígito 4: Unidad de BPM
 
 ;*******************************************************************************
-; @brief    Construye la trama ASCII "Txx,Myy,Bzzz\r\n" en TX_BUF si está libre.
+; @brief    Construye la trama ASCII "Txx,Myy,Bzzz\r\n" y activa TXIE
+;           (se omite si BIT_MODO_GRAFICO = 1 para no interferir el CSV).
 ;*******************************************************************************
-PREPARAR_TRAMA_UART:
-    MOVF    TX_LEN, F
-    BTFSS   STATUS, Z           ; Si aún hay una trama enviándose, no sobreescribe
+ARMAR_Y_ENVIAR_TRAMA_UART
+    BTFSC   BANDERAS, BIT_MODO_GRAFICO  ; Si está graficando ADC, prioriza trama CSV
+    RETURN
+    MOVF    BYTES_PENDIENTES_TX, F
+    BTFSS   STATUS, Z                   ; Si aún hay una trama enviándose, no sobreescribe
     RETURN
 
     MOVLW   'T'
-    MOVWF   TX_BUF + d'0'
+    MOVWF   BUFFER_TRAMA_TX + d'0'
     MOVLW   ','
-    MOVWF   TX_BUF + d'3'
+    MOVWF   BUFFER_TRAMA_TX + d'3'
     MOVLW   'M'
-    MOVWF   TX_BUF + d'4'
+    MOVWF   BUFFER_TRAMA_TX + d'4'
     MOVLW   ','
-    MOVWF   TX_BUF + d'7'
+    MOVWF   BUFFER_TRAMA_TX + d'7'
     MOVLW   'B'
-    MOVWF   TX_BUF + d'8'
-    MOVLW   0x0D                ; CR (\r)
-    MOVWF   TX_BUF + d'12'
-    MOVLW   0x0A                ; LF (\n)
-    MOVWF   TX_BUF + d'13'
+    MOVWF   BUFFER_TRAMA_TX + d'8'
+    MOVLW   0x0D                        ; CR (\r)
+    MOVWF   BUFFER_TRAMA_TX + d'12'
+    MOVLW   0x0A                        ; LF (\n)
+    MOVWF   BUFFER_TRAMA_TX + d'13'
 
     ; --- Temperatura (Txx) ---
-    MOVF    TEMP_C, W
-    MOVWF   UNITS
-    MOVLW   d'100'
-    SUBWF   UNITS, W
-    BTFSS   STATUS, C
-    GOTO    $+3
-    MOVLW   d'99'
-    MOVWF   UNITS
-    CALL    DIV_UNITS_10
-    MOVF    TENS, W
+    CALL    LIMITAR_TEMP_A_99
+    CALL    EXTRAER_DECENAS_UNIDADES
+    MOVF    DECENAS, W
     ADDLW   '0'
-    MOVWF   TX_BUF + d'1'
-    MOVF    UNITS, W
+    MOVWF   BUFFER_TRAMA_TX + d'1'
+    MOVF    UNIDADES, W
     ADDLW   '0'
-    MOVWF   TX_BUF + d'2'
+    MOVWF   BUFFER_TRAMA_TX + d'2'
 
     ; --- Estado de medición / cuenta regresiva (Myy) ---
-    BTFSC   FLAGS, F_MEAS_ACTIVE
-    GOTO    PTU_MEAS_ON
+    BTFSC   BANDERAS, BIT_MIDIENDO_PULSO
+    GOTO    CARGAR_SEGUNDOS_TRAMA
     MOVLW   '0'
-    MOVWF   TX_BUF + d'5'
-    MOVWF   TX_BUF + d'6'
-    GOTO    PTU_BPM
+    MOVWF   BUFFER_TRAMA_TX + d'5'
+    MOVWF   BUFFER_TRAMA_TX + d'6'
+    GOTO    CARGAR_BPM_TRAMA
 
-PTU_MEAS_ON:
-    MOVF    COUNTDOWN_SEC, W
-    MOVWF   UNITS
-    CALL    DIV_UNITS_10
-    MOVF    TENS, W
+CARGAR_SEGUNDOS_TRAMA
+    MOVF    SEGUNDOS_RESTANTES, W
+    MOVWF   UNIDADES
+    CALL    EXTRAER_DECENAS_UNIDADES
+    MOVF    DECENAS, W
     ADDLW   '0'
-    MOVWF   TX_BUF + d'5'
-    MOVF    UNITS, W
+    MOVWF   BUFFER_TRAMA_TX + d'5'
+    MOVF    UNIDADES, W
     ADDLW   '0'
-    MOVWF   TX_BUF + d'6'
+    MOVWF   BUFFER_TRAMA_TX + d'6'
 
     ; --- Frecuencia cardíaca (Bzzz) ---
-PTU_BPM:
-    MOVF    BPM_VAL, W
-    MOVWF   UNITS
-    CLRF    HUNDREDS
-PTU_DIV100:
-    MOVLW   d'100'
-    SUBWF   UNITS, W
-    BTFSS   STATUS, C
-    GOTO    PTU_BPM_10
-    MOVWF   UNITS
-    INCF    HUNDREDS, F
-    GOTO    PTU_DIV100
-PTU_BPM_10:
-    CALL    DIV_UNITS_10
-    MOVF    HUNDREDS, W
+CARGAR_BPM_TRAMA
+    MOVF    FRECUENCIA_BPM, W
+    CALL    CONVERTIR_A_3_DIGITOS
+    MOVF    CENTENAS, W
     ADDLW   '0'
-    MOVWF   TX_BUF + d'9'
-    MOVF    TENS, W
+    MOVWF   BUFFER_TRAMA_TX + d'9'
+    MOVF    DECENAS, W
     ADDLW   '0'
-    MOVWF   TX_BUF + d'10'
-    MOVF    UNITS, W
+    MOVWF   BUFFER_TRAMA_TX + d'10'
+    MOVF    UNIDADES, W
     ADDLW   '0'
-    MOVWF   TX_BUF + d'11'
+    MOVWF   BUFFER_TRAMA_TX + d'11'
 
-    CLRF    TX_IDX
-    MOVLW   TX_FRAME_LEN
-    MOVWF   TX_LEN
+    CLRF    INDICE_TX
+    MOVLW   LARGO_TRAMA_TX
+    MOVWF   BYTES_PENDIENTES_TX
+
+    BANKSEL PIE1
+    BSF     PIE1, TXIE                  ; Dispara transmisión por interrupción EUSART TX
+    BANKSEL PORTB                       ; Retorna a Banco 0
     RETURN
 
 ;*******************************************************************************
-; @brief    Envía 1 byte de TX_BUF por EUSART TX sin bloquear el lazo principal.
+; @brief    Construye la trama CSV "XXX,L\r\n" con la muestra ADC de AN1 y el
+;           estado del detector de latido (100 Hz) para graficación.
 ;*******************************************************************************
-ENVIAR_BYTE_UART:
-    BTFSS   PIR1, TXIF          ; ¿Buffer TXREG disponible?
+ENVIAR_TRAMA_ADC_PULSO
+    MOVF    BYTES_PENDIENTES_TX, F
+    BTFSS   STATUS, Z                   ; Si el transmisor está ocupado, evita sobreescribir
     RETURN
-    BCF     STATUS, IRP         ; Direccionamiento indirecto en Banco 0
-    MOVLW   TX_BUF
-    ADDWF   TX_IDX, W
-    MOVWF   FSR
-    MOVF    INDF, W
-    MOVWF   TXREG               ; Transmite carácter
-    INCF    TX_IDX, F
-    DECFSZ  TX_LEN, F
-    RETURN
-    CLRF    TX_IDX              ; Trama completa enviada
+
+    MOVF    MUESTRA_ADC_PULSO, W
+    CALL    CONVERTIR_A_3_DIGITOS
+    MOVF    CENTENAS, W
+    ADDLW   '0'
+    MOVWF   BUFFER_TRAMA_TX + d'0'
+    MOVF    DECENAS, W
+    ADDLW   '0'
+    MOVWF   BUFFER_TRAMA_TX + d'1'
+    MOVF    UNIDADES, W
+    ADDLW   '0'
+    MOVWF   BUFFER_TRAMA_TX + d'2'
+
+    MOVLW   ','
+    MOVWF   BUFFER_TRAMA_TX + d'3'
+
+    MOVLW   '0'
+    BTFSC   BANDERAS, BIT_LATIDO_DETECTADO
+    MOVLW   '1'
+    MOVWF   BUFFER_TRAMA_TX + d'4'
+
+    MOVLW   0x0D                        ; CR (\r)
+    MOVWF   BUFFER_TRAMA_TX + d'5'
+    MOVLW   0x0A                        ; LF (\n)
+    MOVWF   BUFFER_TRAMA_TX + d'6'
+
+    CLRF    INDICE_TX
+    MOVLW   LARGO_TRAMA_GRAFICO
+    MOVWF   BYTES_PENDIENTES_TX
+
+    BANKSEL PIE1
+    BSF     PIE1, TXIE                  ; Inicia transmisión por interrupción EUSART TX
+    BANKSEL PORTB                       ; Retorna a Banco 0
     RETURN
     
 ;===============================================================================        
